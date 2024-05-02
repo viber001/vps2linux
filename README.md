@@ -57,7 +57,9 @@ Since it will erase all the system directories except from the _Bootstrap chroot
 the only way to launch a command inside the _Bootstrap chroot_ is to using ld.so from the _Bootstrap chroot_ itself.
 
 At this point _Arch Linux_ has been installed, but not configured.
-The script will provide a SSH-able system automagically configuring grub (or syslinux), network and restoring the root password from the original system (or by using `vps2arch` as password if no root password was set).
+The script will provide a SSH-able system automagically configuring grub (or syslinux), network and by setting a root password.
+If a root password was already set on the original system, that password will be restored.
+If no root password was set on the original system, a random password will be generated and printed in the final message on script completion.
 
 Once done doing its job, the script will ask you to manually reboot your _VPS_ and voilà, PROFIT!
 

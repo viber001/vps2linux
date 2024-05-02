@@ -34,6 +34,8 @@ cpu_type=$(uname -m)
 is_openvz() { [ -d /proc/vz -a ! -d /proc/bc ]; }
 is_lxc() { grep -aqw container=lxc /proc/1/environ ; }
 
+root_pw=
+
 download() {
 	local path="$1" x=
 	shift
@@ -116,7 +118,7 @@ delete_all() {
 }
 
 install_packages() {
-	local packages="base openssh reflector"
+	local packages="base openssh openssl reflector"
 	is_openvz || packages="$packages linux lvm2"
 	[ "$bootloader" != "none" ] && packages="$packages $bootloader"
 	# XXX Install gptdisk for syslinux. To be removed then FS#45029 will be closed
@@ -135,7 +137,9 @@ install_packages() {
 restore_root_pass() {
 	# If the root password is not set, use vps2arch
 	if egrep -q '^root:[^$]' "/root.$cpu_type/root.passwd"; then
-		echo "root:vps2arch" | chpasswd
+		root_pw=$(openssl rand -base64 18)
+		echo "Using root password $root_pw" >&2
+		echo "root:$root_pw" | chpasswd
 	else
 		sed -i '/^root:/d' /etc/shadow
 		cat "/root.$cpu_type/root.passwd" >> /etc/shadow
@@ -280,8 +284,17 @@ finalize() {
 		When you are finished with your post-installation, you'll need to reboot the VM the rough way:
 		# sync ; reboot -f
 
-		Then you'll be able to connect to your VM using SSH and to login using your old root password (or "vps2arch" if you didn't have a root password).
 	EOF
+
+	if [ -z "$root_pw" ]; then
+		cat <<-EOF
+			Then you'll be able to connect to your VM using SSH and to login using your old root password.
+		EOF
+	else
+		cat <<-EOF
+			Then you'll be able to connect to your VM using SSH and to login using root password $root_pw
+		EOF
+	fi
 }
 
 bootloader=grub
