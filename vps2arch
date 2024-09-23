@@ -231,7 +231,7 @@ configure_network() {
 			rshift(and(ip,0x00ff0000),16), rshift(and(ip,0xff000000),24)) ; exit }' < /proc/net/route)
 	EOF
 
-	set -- "$(ip addr show dev "$_configure_network_dev" | awk '($1 == "inet") { print $2 }')"
+	set -- "$(ip addr show dev "$_configure_network_dev" | awk '($0 ~ /inet.+ scope global/) { print $2 }')"
 	_configure_network_ip=$*
 
 	# FIXME Not supported for "P2P" interfaces, such as venet, yet
