@@ -109,13 +109,19 @@ backup_old_files() {
 }
 
 delete_all() {
+	local args=(! -path '/dev/*' -and ! -path '/proc/*' -and ! -path '/sys/*' -and ! -path '/selinux/*' -and ! -path "/root.$cpu_type/*")
+
+	if [ $preserve_home -eq 1 ]; then
+		args+=(-and ! -path "/home/*")
+	fi
+
 	# Remove immutable flag from any files / directories
 	if command -v chattr >/dev/null 2>&1; then
-		find / -type f \( ! -path '/dev/*' -and ! -path '/proc/*' -and ! -path '/sys/*' -and ! -path '/selinux/*' -and ! -path "/root.$cpu_type/*" \) \
+		find / -type f \( "${args[@]}" \) \
 			-exec chattr -i {} + 2>/dev/null || true
 	fi
 	# Delete *all* files from /
-	find / \( ! -path '/dev/*' -and ! -path '/proc/*' -and ! -path '/sys/*' -and ! -path '/selinux/*' -and ! -path "/root.$cpu_type/*" \) -delete 2>/dev/null || true
+	find / \( "${args[@]}" \) -delete 2>/dev/null || true
 }
 
 install_packages() {
@@ -295,8 +301,9 @@ finalize() {
 bootloader=grub
 network=systemd-networkd
 mirrors=
+preserve_home=0
 
-while getopts ":b:m:n:h" opt; do
+while getopts ":b:m:n:ph" opt; do
 	case $opt in
 	b)
 		if [ "$OPTARG" != "grub" ] && [ "$OPTARG" != "syslinux" ] && [ "$OPTARG" != "none" ]; then
@@ -315,6 +322,9 @@ while getopts ":b:m:n:h" opt; do
 		fi
 		network="$OPTARG"
 		;;
+	p)
+		preserve_home=1
+		;;
 	h)
 		cat <<-EOF
 			usage: ${0##*/} [options]
@@ -323,6 +333,7 @@ while getopts ":b:m:n:h" opt; do
 			    -b (grub|syslinux)           Use the specified bootloader. When this option is omitted, it defaults to grub.
 			    -n (systemd-networkd|netctl) Use the specified networking configuration system. When this option is omitted, it defaults to systemd-networkd.
 			    -m mirror                    Use the provided mirror (you can specify this option more than once).
+			    -p                           Preserve /home - do not delete this directory during cleanup.
 
 			    -h                           Print this help message
 
