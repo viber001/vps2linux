@@ -31,7 +31,7 @@ if ! command -v zstd >/dev/null 2>&1; then
 fi
 
 get_worldwide_mirrors() {
-	_download 'https://www.archlinux.org/mirrorlist/?country=all&protocol=https&ip_version=4' | awk '/^## /{if ($2 == "Worldwide") { flag=1 } else { flag=0 } } /^#Server/ { if (flag) { sub(/\/\$repo.*/, ""); print $3 } }'
+	_download 'https://www.archlinux.org/mirrorlist/?country=all&protocol=https&protocol=http' | awk '/^## /{if ($2 == "Worldwide") { flag=1 } else { flag=0 } } /^#Server/ { if (flag) { sub(/\/\$repo.*/, ""); print $3 } }'
 }
 
 cpu_type=$(uname -m)
@@ -273,11 +273,11 @@ finalize() {
 	
 	cat <<-EOF
 	
-		Reflector: Rating the 35 most recently synced HTTPS servers, sorting them by download speed
+		Reflector: Rating the 35 most recently synced HTTP/HTTPS servers, sorting them by download speed
 		
 	EOF
 	
-	reflector -l 35 -p https --sort rate --save /etc/pacman.d/mirrorlist
+	reflector -l 35 -p http,https --sort rate --save /etc/pacman.d/mirrorlist
 
 	cat <<-EOF
 		Hi,
