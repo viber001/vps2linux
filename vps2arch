@@ -258,41 +258,91 @@ configure_bootloader() {
 }
 
 configure_network() {
-	read -r _configure_network_dev _configure_network_gateway <<-EOF
-		$(awk '$2 == "00000000" { ip = strtonum(sprintf("0x%s", $3));
-			printf ("%s\t%d.%d.%d.%d", $1,
-			rshift(and(ip,0x000000ff),00), rshift(and(ip,0x0000ff00),08),
-			rshift(and(ip,0x00ff0000),16), rshift(and(ip,0xff000000),24)) ; exit }' < /proc/net/route)
-	EOF
+	local gateway dev ip4 gateway6 ip6 dhcp4 dhcp6 ip4route ip6route
 
-	set -- "$(ip addr show dev "$_configure_network_dev" | awk '($0 ~ /inet.+ scope global/) { print $2 }')"
-	_configure_network_ip=$*
+	ip4route=$(ip -4 route show default)
+	ip6route=$(ip -6 route show default)
+	# FIXME will produce broken configuration with multiple interfaces being UP
+	# need to determine devs from ip4route/ip6route
+	dev=$(ip -brief link | awk '$2 == "UP" {split($1, r, "@"); print r[1]}')
+	if [ -n "$ip4route" ]; then
+		gateway=$(echo "$ip4route" | grep "$dev" | awk '{ print $3 }')
+		set -- "$(ip -4 addr show dev "$dev" | awk '($1 == "inet") { print $2 }')"
+		ip4=$*
+		dhcp4=$(ip -4 addr show dev "$dev" | grep -cw dynamic)
+	fi
+	if [ -n "$ip6route" ]; then
+		gateway6=$(echo "$ip6route" | grep "$dev" | awk '{ print $3 }')
+		set -- "$(ip -6 addr show dev "$dev" | awk '($1 == "inet6" && $2 !~ /^fe80/) { print $2 }')"
+		ip6=$*
+		dhcp6=$(ip -6 addr show dev "$dev" | grep -cw dynamic)
+	fi
 
 	# FIXME Not supported for "P2P" interfaces, such as venet, yet
 	if [ "$network" = "systemd-networkd" ]; then
-		cat > /etc/systemd/network/default.network <<-EOF
-			[Match]
-			Name=$_configure_network_dev
+		{
+			echo "[Match]"
+			echo "Name=$dev"
+			echo -e "\n[Network]"
 
-			[Network]
-			Gateway=$_configure_network_gateway
-		EOF
-		for _configure_network_ip in $_configure_network_ip; do
-			echo "Address=$_configure_network_ip"
-		done >> /etc/systemd/network/default.network
+			if [ "$dhcp4" -ne '0' ] && [ "$dhcp6" -ne '0' ]; then
+				echo "DHCP=yes"
+			elif [ "$dhcp4" -ne '0' ]; then
+				echo "DHCP=ipv6"
+			elif [ "$dhcp6" -ne '0' ]; then
+				echo "DHCP=ipv4"
+			fi
+
+			if [ "$dhcp4" -eq '0' ]; then
+				if [ -n "$gateway" ]; then
+					echo "Gateway=$gateway"
+				fi
+				for ip in $ip4; do
+					echo "Address=$ip"
+				done
+			fi
+
+			if [ "$dhcp6" -eq '0' ]; then
+				if [ -n "$gateway6" ]; then
+					echo "Gateway=$gateway6"
+				fi
+				for ip in $ip6; do
+					echo "Address=$ip"
+				done
+			fi
+		} >/etc/systemd/network/default.network
 		systemctl enable systemd-networkd
 	elif [ "$network" = "netctl" ]; then
-		cat > /etc/netctl/default <<-EOF
-			Interface=$_configure_network_dev
-			Connection=ethernet
-			IP=static
-			Address=($_configure_network_ip)
-		EOF
-		if [ "$_configure_network_gateway" = "0.0.0.0" ]; then
-			echo 'Routes=(0.0.0.0/0)'
-		else
-			echo "Gateway=$_configure_network_gateway"
-		fi >> /etc/netctl/default
+		{
+			echo "Interface=$dev"
+			echo "Connection=ethernet"
+			if [ "$dhcp4" -ne '0' ]; then
+				echo "IP=dhcp"
+			else
+				if [ -n "$gateway" ]; then
+					echo "IP=static"
+					echo "Address=($ip4)"
+					if [ "$gateway" = "0.0.0.0" ]; then
+						echo 'Routes=(0.0.0.0/0)'
+					else
+						echo "Gateway=$gateway"
+					fi
+				fi
+			fi
+			if [ "$dhcp6" -ne '0' ]; then
+				echo "IP6=dhcp"
+			else
+				if [ -n "$gateway6" ]; then
+					echo "IP6=static"
+					echo "Address6=($ip6)"
+					if [ "$gateway6" = "::" ]; then
+						echo 'Routes6=(::/0)'
+					else
+						echo "Gateway6=$gateway6"
+					fi
+				fi
+			fi
+		} >/etc/netctl/default
 		netctl enable default
 	fi
 
