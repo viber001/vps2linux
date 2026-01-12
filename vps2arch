@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Copyright 2026, Dmitry Geels https://gitlab.com/dmig
+# Copyright 2025, Edgist https://github.com/edgist
+# Copyright 2025, Annanke https://github.com/Anankke
+# Copyright 2024, Felix Yan <felixonmars@archlinux.org>
 # Copyright 2015, Timothy Redaelli <tredaelli@archlinux.info>
 
 # This program is free software: you can redistribute it and/or modify
@@ -17,9 +21,9 @@ set -e
 
 # Gathering informations about actual environment.
 if command -v wget >/dev/null 2>&1; then
-	_download() { wget -O- "$@" ; }
+	_download() { wget -O- "$@"; }
 elif command -v curl >/dev/null 2>&1; then
-	_download() { curl -fL "$@" ; }
+	_download() { curl -fL "$@"; }
 else
 	echo "This script needs curl or wget" >&2
 	exit 2
@@ -37,7 +41,7 @@ get_worldwide_mirrors() {
 cpu_type=$(uname -m)
 
 is_openvz() { [ -d /proc/vz ] && [ ! -d /proc/bc ]; }
-is_lxc() { grep -aqw container=lxc /proc/1/environ ; }
+is_lxc() { grep -aqw container=lxc /proc/1/environ; }
 
 download() {
 	_download_path="$1" _download_x=
@@ -100,7 +104,7 @@ configure_chroot() {
 }
 
 save_root_pass() {
-	grep '^root:' /etc/shadow > "/root.$cpu_type/root.passwd"
+	grep '^root:' /etc/shadow >"/root.$cpu_type/root.passwd"
 	chmod 0600 "/root.$cpu_type/root.passwd"
 }
 
@@ -131,13 +135,12 @@ install_packages() {
 	set -- base openssh reflector
 	is_openvz || set -- "$@" linux lvm2
 	[ "$bootloader" != "none" ] && set -- "$@" "$bootloader"
-	# XXX Install gptdisk for syslinux. To be removed then FS#45029 will be closed
 	[ "$bootloader" = "syslinux" ] && set -- "$@" gptfdisk
 	[ -f /sys/firmware/efi/fw_platform_size ] && set -- "$@" efibootmgr
 	[ "$network" = "netctl" ] && set -- "$@" netctl
 	while read -r _ mountpoint filesystem _; do
 		[ "$mountpoint" = "/" ] && [ "$filesystem" = "xfs" ] && packages="$packages xfsprogs"
-	done < /proc/mounts
+	done </proc/mounts
 	# Black magic!
 	"$ld_so" --library-path "/root.$cpu_type/usr/lib" \
 		"/root.$cpu_type/usr/bin/chroot" "/root.$cpu_type" /usr/bin/pacstrap -M /mnt "$@"
@@ -150,7 +153,7 @@ restore_root_pass() {
 		echo "root:vps2arch" | chpasswd
 	else
 		sed -i '/^root:/d' /etc/shadow
-		cat "/root.$cpu_type/root.passwd" >> /etc/shadow
+		cat "/root.$cpu_type/root.passwd" >>/etc/shadow
 	fi
 }
 
@@ -208,7 +211,7 @@ configure_bootloader() {
 			grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB
 			;;
 		esac
-		grub-mkconfig > /boot/grub/grub.cfg
+		grub-mkconfig >/boot/grub/grub.cfg
 	elif [ "$bootloader" = "syslinux" ]; then
 		# If you are still using eth* as interface name, disable "strange" ifnames
 		grep -q '^[[:space:]]*eth' /proc/net/dev && tmp="net.ifnames=0"
@@ -274,15 +277,11 @@ finalize() {
 
 	# Enable SSH login for user root (#3)
 	sed -i '/^#PermitRootLogin\s/s/.*/&\nPermitRootLogin yes/' /etc/ssh/sshd_config
-	
+
 	# Run reflector to get updated mirrors
-	
 	cat <<-EOF
-	
 		Reflector: Rating the 35 most recently synced HTTP/HTTPS servers, sorting them by download speed
-		
 	EOF
-	
 	reflector -l 35 -p http,https --sort rate --save /etc/pacman.d/mirrorlist
 
 	cat <<-EOF
@@ -330,15 +329,15 @@ while getopts ":b:m:n:ph" opt; do
 			usage: ${0##*/} [options]
 
 			  Options:
-			    -b (grub|syslinux)           Use the specified bootloader. When this option is omitted, it defaults to grub.
-			    -n (systemd-networkd|netctl) Use the specified networking configuration system. When this option is omitted, it defaults to systemd-networkd.
-			    -m mirror                    Use the provided mirror (you can specify this option more than once).
-			    -p                           Preserve /home - do not delete this directory during cleanup.
+				-b (grub|syslinux)           Use the specified bootloader. When this option is omitted, it defaults to grub.
+				-n (systemd-networkd|netctl) Use the specified networking configuration system. When this option is omitted, it defaults to systemd-networkd.
+				-m mirror                    Use the provided mirror (you can specify this option more than once).
+				-p                           Preserve /home - do not delete this directory during cleanup.
 
-			    -h                           Print this help message
+				-h                           Print this help message
 
-			    Warning:
-			      On OpenVZ containers the bootloader will be not installed and the networking configuration system will be enforced to netctl.
+				Warning:
+				  On OpenVZ containers the bootloader will be not installed and the networking configuration system will be enforced to netctl.
 		EOF
 		exit 0
 		;;
