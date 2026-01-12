@@ -76,21 +76,22 @@ is_openvz() { [ -d /proc/vz ] && [ ! -d /proc/bc ]; }
 is_lxc() { grep -aqw container=lxc /proc/1/environ; }
 
 download() {
-	_download_path="$1" _download_x=
+	local path="$1" x=
 	shift
-	for _download_x in $mirrors; do
-		_download "$_download_x/$_download_path" && return 0
+	for x in $mirrors; do
+		_download "$x$path" && return 0
 	done
 	return 1
 }
 
 download_and_extract_bootstrap() {
-	download iso/latest/sha256sums.txt | grep -F "$cpu_type.tar.zst" > "sha256sums.txt"
-	read -r _ _download_and_extract_bootstrap_filename < "sha256sums.txt"
-	download "iso/latest/$_download_and_extract_bootstrap_filename" > "$_download_and_extract_bootstrap_filename"
-	grep -v archlinux-bootstrap-x86_64.tar.zst sha256sums.txt | sha256sum -c || exit 1
-	zstd -d -c "$_download_and_extract_bootstrap_filename" | tar -xpf -
-	rm -f "$_download_and_extract_bootstrap_filename"
+	local filename
+	download iso/latest/sha256sums.txt | grep -E "[[:digit:]]-$cpu_type.tar.zst" >"sha256sums.txt"
+	read -r _ filename <"sha256sums.txt"
+	download "iso/latest/$filename" >"$filename"
+	sha256sum -c sha256sums.txt || exit 1
+	tar -xpf "$filename"
+	rm -f "$filename"
 	cp -L /etc/resolv.conf "/root.$cpu_type/etc"
 
 	# Mount options taked from arch-chroot script
@@ -118,9 +119,10 @@ chroot_exec() {
 }
 
 configure_chroot() {
-	for _configure_chroot_m in $mirrors; do
-		echo "Server = $_configure_chroot_m/\$repo/os/\$arch"
-	done >> "/root.$cpu_type/etc/pacman.d/mirrorlist"
+	local m
+	for m in $mirrors; do
+		echo 'Server = '"$m"'/$repo/os/$arch'
+	done >>"/root.$cpu_type/etc/pacman.d/mirrorlist"
 	# Install and initialize haveged if needed
 	if ! is_openvz && ! pidof haveged >/dev/null; then
 		# Disable signature check, install and launch haveged and re-enable signature checks.
@@ -196,20 +198,16 @@ cleanup() {
 }
 
 configure_bootloader() {
-	_configure_bootloader_root_devs=''
-	_configure_bootloader_tmp=''
-	_configure_bootloader_needs_lvm2=0
-	_configure_bootloader_uefi=0
-	_configure_bootloader_root_dev=$(findmnt -no SOURCE /)
-
-	case $_configure_bootloader_root_dev in
-	/dev/mapper/*) _configure_bootloader_needs_lvm2=1 ;;
+	local root_dev root_devs tmp needs_lvm2 uefi=0
+	root_dev=$(findmnt -no SOURCE / | sed 's/\[.*\]$//')
+	case $root_dev in
+	/dev/mapper/*) needs_lvm2=1 ;;
 	esac
 	if [ -f /sys/firmware/efi/fw_platform_size ]; then
-		_configure_bootloader_uefi=$(cat /sys/firmware/efi/fw_platform_size)
+		uefi=$(cat /sys/firmware/efi/fw_platform_size)
 	fi
 
-	if [ $_configure_bootloader_needs_lvm2 -eq 1 ]; then
+	if [ $needs_lvm2 -eq 1 ]; then
 		# Some distro doesn't use lvmetad by default
 		sed -i.bak 's/use_lvmetad = 1/use_lvmetad = 0/g' /etc/lvm/lvm.conf
 	fi
@@ -222,21 +220,22 @@ configure_bootloader() {
 		# Disable "graphic" terminal output
 		sed -i.bak 's/^#GRUB_TERMINAL_OUTPUT=console/GRUB_TERMINAL_OUTPUT=console/' /etc/default/grub
 
-		if [ $_configure_bootloader_needs_lvm2 -eq 1 ]; then
-			_configure_bootloader_vg=$(lvs --noheadings "$_configure_bootloader_root_dev" | awk '{print $2}')
-			_configure_bootloader_root_dev=$(pvs --noheadings | awk -v vg="$_configure_bootloader_vg" '($2 == vg) { print $1 }')
+		if [ $needs_lvm2 -eq 1 ]; then
+			local vg
+			vg=$(lvs --noheadings "$root_dev" | awk '{print $2}')
+			root_dev=$(pvs --noheadings | awk -v vg="$vg" '($2 == vg) { print $1 }')
 		fi
-		for _configure_bootloader_root_dev in $_configure_bootloader_root_dev; do
-			_configure_bootloader_tmp=$(lsblk -npsro TYPE,NAME "$_configure_bootloader_root_dev" | awk '($1 == "disk") { print $2}')
-			case " $_configure_bootloader_root_devs " in
-			*" $_configure_bootloader_tmp "*) 	;;
-			*)		_configure_bootloader_root_devs="${_configure_bootloader_root_devs:+$_configure_bootloader_root_devs }$_configure_bootloader_tmp"	;;
+		for root_dev in $root_dev; do
+			tmp=$(lsblk -npsro TYPE,NAME "$root_dev" | awk '($1 == "disk") { print $2}')
+			case " $root_devs " in
+			*" $tmp "*) ;;
+			*) root_devs="${root_devs:+$root_devs }$tmp" ;;
 			esac
 		done
-		case $_configure_bootloader_uefi in
+		case $uefi in
 		0)
-			for _configure_bootloader_root_dev in $_configure_bootloader_root_devs; do
-				grub-install --target=i386-pc --recheck --force "$_configure_bootloader_root_dev"
+			for root_dev in $root_devs; do
+				grub-install --target=i386-pc --recheck --force "$root_dev"
 			done
 			;;
 		64)
@@ -248,10 +247,10 @@ configure_bootloader() {
 		# If you are still using eth* as interface name, disable "strange" ifnames
 		grep -q '^[[:space:]]*eth' /proc/net/dev && tmp="net.ifnames=0"
 		syslinux-install_update -ami
-		sed -i "s;\(^[[:space:]]*APPEND.*\)root=[^[:space:]]*;\1root=$_configure_bootloader_root_dev${_configure_bootloader_tmp:+ $_configure_bootloader_tmp};" /boot/syslinux/syslinux.cfg
+		sed -i "s;\(^[[:space:]]*APPEND.*\)root=[^[:space:]]*;\1root=$root_dev${tmp:+ $tmp};" /boot/syslinux/syslinux.cfg
 	fi
 
-	if [ $_configure_bootloader_needs_lvm2 -eq 1 ]; then
+	if [ $needs_lvm2 -eq 1 ]; then
 		mv /etc/lvm/lvm.conf.bak /etc/lvm/lvm.conf
 		sed -i '/HOOKS/s/block/& lvm2/' /etc/mkinitcpio.conf
 		mkinitcpio -p linux
