@@ -166,7 +166,8 @@ install_packages() {
 	set -- "/root.$cpu_type/usr/lib"/ld-*.so.2
 	ld_so=$1
 
-	set -- base openssh reflector
+	# force install iptables-nft to avoid implicit installation of iptables-legacy
+	set -- base openssh iptables-nft reflector
 	is_openvz || set -- "$@" linux lvm2
 	[ "$bootloader" != "none" ] && set -- "$@" "$bootloader"
 	[ "$bootloader" = "syslinux" ] && set -- "$@" gptfdisk
@@ -198,7 +199,7 @@ cleanup() {
 }
 
 configure_bootloader() {
-	local root_dev root_devs tmp needs_lvm2 uefi=0
+	local root_dev root_devs tmp needs_lvm2=0 uefi=0
 	root_dev=$(findmnt -no SOURCE / | sed 's/\[.*\]$//')
 	case $root_dev in
 	/dev/mapper/*) needs_lvm2=1 ;;
