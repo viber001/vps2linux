@@ -30,12 +30,44 @@ else
 fi
 
 if ! command -v zstd >/dev/null 2>&1; then
-	_download "https://people.redhat.com/~tredaell/zstd" > /usr/bin/zstd
+	_download "https://people.redhat.com/~tredaell/zstd" >/usr/bin/zstd
 	chmod +x /usr/bin/zstd
 fi
 
-get_worldwide_mirrors() {
-	_download 'https://www.archlinux.org/mirrorlist/?country=all&protocol=https&protocol=http' | awk '/^## /{if ($2 == "Worldwide") { flag=1 } else { flag=0 } } /^#Server/ { if (flag) { sub(/\/\$repo.*/, ""); print $3 } }'
+get_country() {
+	# Try multiple APIs in case one fails
+	local country
+
+	# Try ipapi.co first
+	country=$(_download "https://ipapi.co/country_code" 2>/dev/null || true)
+	if [ -n "$country" ] && [ "$country" != "403" ]; then
+		echo "$country"
+		return
+	fi
+
+	# Try ifconfig.co
+	country=$(_download "https://ifconfig.co/country-iso" 2>/dev/null || true)
+	if [ -n "$country" ] && [ "$country" != "403" ]; then
+		echo "$country"
+		return
+	fi
+
+	# Try ip-api.com
+	country=$(_download "http://ip-api.com/json/" 2>/dev/null | grep -oP '(?<="countryCode":")\w+' || true)
+	if [ -n "$country" ]; then
+		echo "$country"
+		return
+	fi
+
+	# Default to 'all' if all APIs fail
+	echo "all"
+}
+
+get_mirrors() {
+	country=$1
+
+	[ -z $country ] && country=$(get_country)
+	_download "https://archlinux.org/mirrorlist/?country=$country&protocol=http&protocol=https&ip_version=4&use_mirror_status=on" | grep -oP '(?<=#Server = ).*(?=\$repo/)' || get_mirrors all
 }
 
 cpu_type=$(uname -m)
@@ -353,8 +385,7 @@ while getopts ":b:m:n:ph" opt; do
 done
 shift $((OPTIND - 1))
 
-[ -z "$mirrors" ] && mirrors=$(get_worldwide_mirrors)
-
+[ -z "$mirrors" ] && mirrors=$(get_mirrors)
 
 if is_openvz; then
 	bootloader=none
