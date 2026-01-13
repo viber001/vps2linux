@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 # Copyright 2026, Dmitry Geels https://gitlab.com/dmig
 # Copyright 2025, Edgist https://github.com/edgist
@@ -16,6 +16,10 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License at <http://www.gnu.org/licenses/> for
 # more details.
+
+# Shellcheck wiki says: local is supported in many shells, including bash, ksh,
+# dash, and BusyBox ash. So use the keyword and suppress warning.
+# shellcheck disable=SC3043
 
 set -e
 
@@ -66,7 +70,8 @@ get_country() {
 get_mirrors() {
 	country=$1
 
-	[ -z $country ] && country=$(get_country)
+	[ -z "$country" ] && country=$(get_country)
+	# shellcheck disable=SC2016
 	_download "https://archlinux.org/mirrorlist/?country=$country&protocol=http&protocol=https&ip_version=4&use_mirror_status=on" | grep -oP '(?<=#Server = ).*(?=\$repo/)' || get_mirrors all
 }
 
@@ -121,7 +126,7 @@ chroot_exec() {
 configure_chroot() {
 	local m
 	for m in $mirrors; do
-		echo 'Server = '"$m"'/$repo/os/$arch'
+		echo "Server = $m/\$repo/os/\$arch"
 	done >>"/root.$cpu_type/etc/pacman.d/mirrorlist"
 	# Install and initialize haveged if needed
 	if ! is_openvz && ! pidof haveged >/dev/null; then
@@ -147,19 +152,19 @@ backup_old_files() {
 }
 
 delete_all() {
-	local args=(! -path '/dev/*' -and ! -path '/proc/*' -and ! -path '/sys/*' -and ! -path '/selinux/*' -and ! -path "/root.$cpu_type/*")
+	set -- ! -path '/dev/*' -and ! -path '/proc/*' -and ! -path '/sys/*' -and ! -path '/selinux/*' -and ! -path "/root.$cpu_type/*"
 
 	if [ $preserve_home -eq 1 ]; then
-		args+=(-and ! -path "/home/*")
+		set -- "$@" -and ! -path "/home/*"
 	fi
 
 	# Remove immutable flag from any files / directories
 	if command -v chattr >/dev/null 2>&1; then
-		find / -type f \( "${args[@]}" \) \
+		find / -type f \( "$@" \) \
 			-exec chattr -i {} + 2>/dev/null || true
 	fi
 	# Delete *all* files from /
-	find / \( "${args[@]}" \) -delete 2>/dev/null || true
+	find / \( "$@" \) -delete 2>/dev/null || true
 }
 
 install_packages() {
@@ -284,7 +289,7 @@ configure_network() {
 		{
 			echo "[Match]"
 			echo "Name=$dev"
-			echo -e "\n[Network]"
+			printf "\n[Network]"
 
 			if [ "$dhcp4" -ne '0' ] && [ "$dhcp6" -ne '0' ]; then
 				echo "DHCP=yes"
