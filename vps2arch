@@ -179,7 +179,7 @@ install_packages() {
 	[ -f /sys/firmware/efi/fw_platform_size ] && set -- "$@" efibootmgr
 	[ "$network" = "netctl" ] && set -- "$@" netctl
 	while read -r _ mountpoint filesystem _; do
-		[ "$mountpoint" = "/" ] && [ "$filesystem" = "xfs" ] && packages="$packages xfsprogs"
+		[ "$mountpoint" = "/" ] && [ "$filesystem" = "xfs" ] && set -- "$@" xfsprogs
 	done </proc/mounts
 	# Black magic!
 	"$ld_so" --library-path "/root.$cpu_type/usr/lib" \
