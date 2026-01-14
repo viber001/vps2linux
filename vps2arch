@@ -68,14 +68,9 @@ get_country() {
 }
 
 get_mirrors() {
-	country=$1
-
-	[ -z "$country" ] && country=$(get_country)
 	# shellcheck disable=SC2016
-	_download "https://archlinux.org/mirrorlist/?country=$country&protocol=http&protocol=https&ip_version=4&use_mirror_status=on" | grep -oP '(?<=#Server = ).*(?=\$repo/)' || get_mirrors all
+	_download "https://archlinux.org/mirrorlist/?country=$country&protocol=http&protocol=https&ip_version=4&use_mirror_status=on" | grep -oP '(?<=#Server = ).*(?=\$repo/)'
 }
-
-cpu_type=$(uname -m)
 
 is_openvz() { [ -d /proc/vz ] && [ ! -d /proc/bc ]; }
 is_lxc() { grep -aqw container=lxc /proc/1/environ; }
@@ -173,7 +168,7 @@ install_packages() {
 	ld_so=$1
 
 	# force install iptables-nft to avoid implicit installation of iptables-legacy
-	set -- base openssh iptables-nft reflector
+	set -- base openssh iptables-nft
 	is_openvz || set -- "$@" linux lvm2
 	[ "$bootloader" != "none" ] && set -- "$@" "$bootloader"
 	[ "$bootloader" = "syslinux" ] && set -- "$@" gptfdisk
@@ -394,12 +389,6 @@ finalize() {
 	# Enable SSH login for user root (#3)
 	echo 'PermitRootLogin yes' >/etc/ssh/sshd_config.d/00-remove-me.conf
 
-	# Run reflector to get updated mirrors
-	cat <<-EOF
-		Reflector: Rating the 35 most recently synced HTTP/HTTPS servers, sorting them by download speed
-	EOF
-	reflector -l 35 -p http,https --sort rate --save /etc/pacman.d/mirrorlist
-
 	cat <<-EOF
 		Hi,
 		your VM has successfully been reimaged with Arch Linux.
@@ -470,6 +459,8 @@ done
 shift $((OPTIND - 1))
 
 [ -z "$mirrors" ] && mirrors=$(get_mirrors)
+country=$(get_country)
+cpu_type=$(uname -m)
 
 if is_openvz; then
 	bootloader=none
