@@ -287,7 +287,7 @@ configure_network() {
 			cat <<-EOF >"/etc/systemd/network/$filename.link"
 				[Match]
 				MACAddress=$mac
-				
+
 				[Link]
 				Name=$dev
 			EOF
@@ -318,7 +318,7 @@ create_networkd_config() {
 	cat <<-EOF
 		[Match]
 		MACAddress=$mac
-		
+
 		[Network]
 	EOF
 
@@ -408,10 +408,10 @@ finalize() {
 		This script configured $bootloader as bootloader and $network for networking.
 	EOF
 	if [ -n "$preserve_paths" ]; then
-	cat <<-EOF
-		
-		Following paths were kept: $preserve_paths
-	EOF
+		cat <<-EOF
+
+			Following paths were kept: $preserve_paths
+		EOF
 	fi
 	cat <<-EOF
 
