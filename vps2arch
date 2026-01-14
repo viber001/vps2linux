@@ -177,7 +177,7 @@ install_packages() {
 	[ "$bootloader" != "none" ] && set -- "$@" "$bootloader"
 	[ "$bootloader" = "syslinux" ] && set -- "$@" gptfdisk
 	[ -f /sys/firmware/efi/fw_platform_size ] && set -- "$@" efibootmgr
-	[ "$network" = "netctl" ] && set -- "$@" netctl
+	[ "$network" = "netctl" ] && set -- "$@" netctl dhcpcd
 	while read -r _ mountpoint filesystem _; do
 		[ "$mountpoint" = "/" ] && [ "$filesystem" = "xfs" ] && set -- "$@" xfsprogs
 	done </proc/mounts
