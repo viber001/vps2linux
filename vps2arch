@@ -477,9 +477,9 @@ while getopts ":b:m:n:p:h" opt; do
 done
 shift $((OPTIND - 1))
 
-[ -z "$mirrors" ] && mirrors=$(get_mirrors)
 country=$(get_country)
 cpu_type=$(uname -m)
+[ -z "$mirrors" ] && mirrors=$(get_mirrors)
 
 if is_openvz; then
 	bootloader=none
