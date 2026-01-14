@@ -387,7 +387,7 @@ finalize() {
 	fi
 
 	# Enable SSH login for user root (#3)
-	sed -i '/^#PermitRootLogin\s/s/.*/&\nPermitRootLogin yes/' /etc/ssh/sshd_config
+	echo 'PermitRootLogin yes' >/etc/ssh/sshd_config.d/00-remove-me.conf
 
 	# Run reflector to get updated mirrors
 	cat <<-EOF
