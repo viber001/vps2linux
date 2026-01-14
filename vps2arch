@@ -259,37 +259,46 @@ configure_bootloader() {
 }
 
 configure_network() {
-	local mac gateway dev ip4 gateway6 ip6 dhcp4 dhcp6 ip4route ip6route
+	local mac gateway dev ip4 gateway6 ip6 dhcp4 dhcp6 ip4route ip6route filename
 
-	ip4route=$(ip -4 route show default)
-	# FIXME create configuration for all interfaces, not just first
-	read -r dev mac <<-EOF
+	while read -r dev mac; do
+		ip4route=$(ip -4 route show default dev "$dev")
+		if [ -n "$ip4route" ]; then
+			gateway=$(echo "$ip4route" | awk '{ print $3 }')
+			set -- "$(ip -4 addr show dev "$dev" | awk '$1 == "inet" {for (i=1; i<=NF; i++) { if ($i == "scope" && $(i+1) == "global") {print $2}}}')"
+			ip4=$*
+			dhcp4=$(ip -4 addr show dev "$dev" | awk '/ dynamic / { print 1; exit } END { print 0 }')
+		fi
+		ip6route=$(ip -6 route show default dev "$dev")
+		if [ -n "$ip6route" ]; then
+			gateway6=$(echo "$ip6route" | awk '{ print $3 }')
+			set -- "$(ip -6 addr show dev "$dev" | awk '($1 == "inet6" && $0 !~ /temporary/) {for (i=1; i<=NF; i++) { if ($i == "scope" && $(i+1) == "global") {print $2}}}')"
+			ip6=$*
+			dhcp6=$(ip -6 addr show dev "$dev" | awk '/ dynamic / { print 1; exit } END { print 0 }')
+		fi
+
+		# FIXME Not supported for "P2P" interfaces, such as venet, yet
+		filename="default-$dev"
+		if [ "$network" = "systemd-networkd" ]; then
+			create_networkd_config "$mac" "$dhcp4" "$dhcp6" "$gateway" "$gateway6" "$ip4" "$ip6" >"/etc/systemd/network/$filename.network"
+		elif [ "$network" = "netctl" ]; then
+			create_netctl_config "$dev" "$dhcp4" "$dhcp6" "$gateway" "$gateway6" "$ip4" "$ip6" >"/etc/netctl/$filename"
+			# pin interface name as netctl profiles can't match mac address
+			cat <<-EOF >"/etc/systemd/network/$filename.link"
+				[Match]
+				MACAddress=$mac
+				
+				[Link]
+				Name=$dev
+			EOF
+			netctl enable "$filename"
+		fi
+	done <<-EOF
 		$(ip -brief link | awk '$1 !~ /^docker/ && $2 == "UP" {split($1, r, "@"); print r[1], $3}')
 	EOF
 
-	if [ -n "$ip4route" ]; then
-		gateway=$(echo "$ip4route" | grep "$dev" | awk '{ print $3 }')
-		set -- "$(ip -4 addr show dev "$dev" | awk '($1 == "inet") { print $2 }')"
-		ip4=$*
-		dhcp4=$(ip -4 addr show dev "$dev" | grep -cw dynamic)
-	fi
-	ip6route=$(ip -6 route show default)
-	if [ -n "$ip6route" ]; then
-		gateway6=$(echo "$ip6route" | grep "$dev" | awk '{ print $3 }')
-		set -- "$(ip -6 addr show dev "$dev" | awk '($1 == "inet6" && $2 !~ /^fe80/) { print $2 }')"
-		ip6=$*
-		dhcp6=$(ip -6 addr show dev "$dev" | grep -cw dynamic)
-	fi
-
-	# FIXME Not supported for "P2P" interfaces, such as venet, yet
 	if [ "$network" = "systemd-networkd" ]; then
-		create_networkd_config "$mac" "$dhcp4" "$dhcp6" "$gateway" "$gateway6" "$ip4" "$ip6" >/etc/systemd/network/default.network
 		systemctl enable systemd-networkd
-	elif [ "$network" = "netctl" ]; then
-		create_netctl_config "$dev" "$dhcp4" "$dhcp6" "$gateway" "$gateway6" "$ip4" "$ip6" >/etc/netctl/default
-		# pin interface name as netctl profiles can't match mac address
-		printf "[Match]\nMACAddress=%s\n\n[Link]\nName=%s\n" "$mac" "$dev" >/etc/systemd/network/default.link
-		netctl enable default
 	fi
 
 	systemctl enable sshd systemd-resolved
@@ -306,9 +315,12 @@ create_networkd_config() {
 	ip4=$6
 	ip6=$7
 
-	echo "[Match]"
-	echo "MACAddress=$mac"
-	printf "\n[Network]\n"
+	cat <<-EOF
+		[Match]
+		MACAddress=$mac
+		
+		[Network]
+	EOF
 
 	if [ "$dhcp4" -ne '0' ] && [ "$dhcp6" -ne '0' ]; then
 		echo "DHCP=yes"
@@ -407,10 +419,10 @@ finalize() {
 	EOF
 	printf "\t- /etc/resolv.conf\n"
 	if [ "$network" = "netctl" ]; then
-		printf "\t- /etc/netctl/default\n"
-		printf "\t- /etc/systemd/network/default.link\n"
+		printf "\t- /etc/netctl/default-*\n"
+		printf "\t- /etc/systemd/network/default-*.link\n"
 	else
-		printf "\t- /etc/systemd/network/default.network\n"
+		printf "\t- /etc/systemd/network/default-*.network\n"
 	fi
 	cat <<-EOF
 
