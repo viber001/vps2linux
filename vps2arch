@@ -291,7 +291,7 @@ configure_network() {
 		netctl enable default
 	fi
 
-	systemctl enable sshd
+	systemctl enable sshd systemd-resolved
 }
 
 create_networkd_config() {
@@ -364,6 +364,7 @@ create_netctl_config() {
 	fi
 	if [ "$dhcp6" -ne '0' ]; then
 		echo "IP6=dhcp"
+		echo "DHCP6Client=('dhcpcd')"
 	else
 		if [ -n "$gateway6" ]; then
 			echo "IP6=static"
