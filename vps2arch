@@ -150,9 +150,9 @@ backup_old_files() {
 delete_all() {
 	set -- ! -path '/dev/*' -and ! -path '/proc/*' -and ! -path '/sys/*' -and ! -path '/selinux/*' -and ! -path "/root.$cpu_type/*"
 
-	if [ $preserve_home -eq 1 ]; then
-		set -- "$@" -and ! -path "/home/*"
-	fi
+	for path in $preserve_paths; do
+		set -- "$@" -and ! -path "$path*"
+	done
 
 	# Remove immutable flag from any files / directories
 	if command -v chattr >/dev/null 2>&1; then
@@ -394,6 +394,25 @@ finalize() {
 		your VM has successfully been reimaged with Arch Linux.
 
 		This script configured $bootloader as bootloader and $network for networking.
+	EOF
+	if [ -n "$preserve_paths" ]; then
+	cat <<-EOF
+		
+		Following paths were kept: $preserve_paths
+	EOF
+	fi
+	cat <<-EOF
+
+		Make sure to check configuration files before rebooting:
+	EOF
+	printf "\t- /etc/resolv.conf\n"
+	if [ "$network" = "netctl" ]; then
+		printf "\t- /etc/netctl/default\n"
+		printf "\t- /etc/systemd/network/default.link\n"
+	else
+		printf "\t- /etc/systemd/network/default.network\n"
+	fi
+	cat <<-EOF
 
 		When you are finished with your post-installation, you'll need to reboot the VM the rough way:
 		# sync ; reboot -f
@@ -405,9 +424,9 @@ finalize() {
 bootloader=grub
 network=systemd-networkd
 mirrors=
-preserve_home=0
+preserve_paths=
 
-while getopts ":b:m:n:ph" opt; do
+while getopts ":b:m:n:p:h" opt; do
 	case $opt in
 	b)
 		if [ "$OPTARG" != "grub" ] && [ "$OPTARG" != "syslinux" ] && [ "$OPTARG" != "none" ]; then
@@ -427,7 +446,7 @@ while getopts ":b:m:n:ph" opt; do
 		network="$OPTARG"
 		;;
 	p)
-		preserve_home=1
+		preserve_paths="${preserve_paths:+$preserve_paths }$OPTARG"
 		;;
 	h)
 		cat <<-EOF
@@ -436,8 +455,8 @@ while getopts ":b:m:n:ph" opt; do
 			  Options:
 				-b (grub|syslinux)           Use the specified bootloader. When this option is omitted, it defaults to grub.
 				-n (systemd-networkd|netctl) Use the specified networking configuration system. When this option is omitted, it defaults to systemd-networkd.
-				-m mirror                    Use the provided mirror (you can specify this option more than once).
-				-p                           Preserve /home - do not delete this directory during cleanup.
+				-m <mirror>                  Use the provided mirror (you can specify this option more than once).
+				-p <path>                    Preserve path - do not delete this path during cleanup (you can specify this option more than once).
 
 				-h                           Print this help message
 
