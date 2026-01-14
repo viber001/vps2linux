@@ -97,7 +97,8 @@ download_and_extract_bootstrap() {
 	sha256sum -c sha256sums.txt || exit 1
 	tar -xpf "$filename"
 	rm -f "$filename"
-	cp -L /etc/resolv.conf "/root.$cpu_type/etc"
+	# do not save systemd-resolved symlink
+	[ -f /etc/resolv.conf ] && cp /etc/resolv.conf "/root.$cpu_type/etc"
 
 	# Mount options taked from arch-chroot script
 	mount -t proc proc -o nosuid,noexec,nodev "/root.$cpu_type/proc"
@@ -184,7 +185,12 @@ install_packages() {
 	# Black magic!
 	"$ld_so" --library-path "/root.$cpu_type/usr/lib" \
 		"/root.$cpu_type/usr/bin/chroot" "/root.$cpu_type" /usr/bin/pacstrap -M /mnt "$@"
-	cp -L "/root.$cpu_type/etc/resolv.conf" /etc
+	if [ -f "/root.$cpu_type/etc/resolv.conf" ]; then
+		cp -L "/root.$cpu_type/etc/resolv.conf" /etc
+	else
+		# use systemd-resolved
+		ln -sf ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+	fi
 }
 
 restore_root_pass() {
