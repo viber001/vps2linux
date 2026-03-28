@@ -23,20 +23,30 @@
 
 set -e
 
-# Gathering informations about actual environment.
-if command -v wget >/dev/null 2>&1; then
-	_download() { wget -O- "$@"; }
-elif command -v curl >/dev/null 2>&1; then
-	_download() { curl -fL "$@"; }
-else
-	echo "This script needs curl or wget" >&2
-	exit 2
-fi
+check_dependencies() {
+    # Gathering informations about actual environment.
+    if command -v wget >/dev/null 2>&1; then
+    	_download() { wget -O- "$@"; }
+    elif command -v curl >/dev/null 2>&1; then
+    	_download() { curl -fL "$@"; }
+    else
+    	echo "This script needs curl or wget" >&2
+    	exit 2
+    fi
 
-if ! command -v zstd >/dev/null 2>&1; then
-	_download "https://people.redhat.com/~tredaell/zstd" >/usr/bin/zstd
-	chmod +x /usr/bin/zstd
-fi
+    for cmd in tar grep sha256sum findmnt chroot find; do
+        if ! command -v $cmd >/dev/null 2>&1; then
+           	echo "This script requires $cmd" >&2
+           	exit 2
+        fi
+    done
+
+    if ! command -v zstd >/dev/null 2>&1; then
+    	_download "https://people.redhat.com/~tredaell/zstd" >/usr/bin/zstd
+    	chmod +x /usr/bin/zstd
+    fi
+}
+
 
 get_country() {
 	# Try multiple APIs in case one fails
@@ -488,6 +498,9 @@ while getopts ":b:m:n:p:h" opt; do
 	esac
 done
 shift $((OPTIND - 1))
+
+# check reqired programs availability first
+check_dependencies
 
 country=$(get_country)
 cpu_type=$(uname -m)
