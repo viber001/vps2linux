@@ -100,7 +100,8 @@ download_and_extract_bootstrap() {
 	read -r _ filename <"sha256sums.txt"
 	download "iso/latest/$filename" >"$filename"
 	sha256sum -c sha256sums.txt || exit 1
-	tar -xpf "$filename"
+	# older tar may not support zstd archives
+	zstd -d -c "$filename" | tar -xp
 	rm -f "$filename"
 	# do not save systemd-resolved symlink
 	[ -f /etc/resolv.conf ] && cp /etc/resolv.conf "/root.$cpu_type/etc"
@@ -475,8 +476,8 @@ while getopts ":b:m:n:p:h" opt; do
 			usage: ${0##*/} [options]
 
 			  Options:
-				-b (grub|syslinux)           Use the specified bootloader. When this option is omitted, it defaults to grub.
-				-n (systemd-networkd|netctl) Use the specified networking configuration system. When this option is omitted, it defaults to systemd-networkd.
+				-b (grub|syslinux)           Use the specified bootloader. When this option is omitted, it defaults to $bootloader.
+				-n (systemd-networkd|netctl) Use the specified networking configuration system. When this option is omitted, it defaults to $network.
 				-m <mirror>                  Use the provided mirror (you can specify this option more than once).
 				-p <path>                    Preserve path - do not delete this path during cleanup (you can specify this option more than once).
 
