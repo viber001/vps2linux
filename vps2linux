@@ -295,9 +295,6 @@ stage_bootstrap() {
 	if command_file=$(command_path efibootmgr); then
 		stage_binary "$command_file"
 	fi
-	if command_file=$(command_path fsfreeze); then
-		stage_binary "$command_file"
-	fi
 	cp -a "$RAW_FILE" "$BOOTSTRAP/run/image.raw"
 	cp -aL "$SSH_KEY_FILE" "$BOOTSTRAP/run/authorized_keys"
 	cat > "$BOOTSTRAP/run/deploy.env" <<EOF
@@ -367,29 +364,14 @@ for proc in /proc/[0-9]*; do
 done
 printf '%s\n' 'Old userspace frozen; continuing with target disk replacement.'
 
-# The old root is still mounted below /oldroot after pivot_root. Flush it,
-# then freeze the filesystem itself: a frozen filesystem rejects every
-# further write, so the former root cannot write its dirty pages back over
-# the freshly written raw image. fsfreeze must run while the device is still
-# writable, because the flush it performs would otherwise fail; the device
-# is switched to read-only only afterwards.
+# The old root is still mounted below /oldroot after pivot_root. Flush it and
+# switch its backing device to read-only, then detach it before touching the
+# disk. blockdev --setro is what actually protects the new image: it makes any
+# late writeback from the former root fail instead of overwriting the freshly
+# written data. An attempted mount -o remount,ro (which fails EBUSY while the
+# old root is busy) was observed to leave pending writeback that still landed
+# on disk after dd, so it is deliberately not attempted here.
 flush_disk
-FROZEN=0
-if mountpoint -q /oldroot 2>/dev/null; then
-	if fsfreeze --freeze /oldroot 2>/dev/null; then
-		FROZEN=1
-		printf '%s\n' 'Former root filesystem frozen; writeback is disabled.'
-	fi
-fi
-# A read-only remount is a second line of defence. After pivot_root some
-# kernels reject the superblock remount because the old root is still
-# busy; the filesystem freeze above already blocks writeback in that case.
-if (( ! FROZEN )) && mountpoint -q /oldroot 2>/dev/null; then
-	if ! mount -o remount,ro /oldroot 2>/dev/null; then
-		mount -o remount,bind,ro /oldroot 2>/dev/null || \
-			printf '%s\n' 'WARNING: former root could not be made read-only; relying on blockdev --setro.' >&2
-	fi
-fi
 if [[ -n "${VPS2LINUX_ROOT_SOURCE:-}" && -b "$VPS2LINUX_ROOT_SOURCE" ]]; then
 	blockdev --setro "$VPS2LINUX_ROOT_SOURCE" || \
 		printf '%s\n' "WARNING: cannot make old root read-only: $VPS2LINUX_ROOT_SOURCE" >&2
@@ -609,6 +591,22 @@ SSHD
 
 systemctl --root="\$ROOT" enable sshd.service
 systemctl --root="\$ROOT" enable NetworkManager.service
+
+# Mirror kernel and systemd output to the VGA console in addition to the serial
+# console, so the boot is visible on the PVE web console even when the serial
+# console is not attached. The image already carries console=tty0 in
+# GRUB_CMDLINE_LINUX_DEFAULT, but its generated grub.cfg omitted it; patch the
+# effective grub.cfg directly and update the bootloader defaults so later
+# grub2-mkconfig runs keep the setting. Effective from the next boot.
+if [[ -f "\$ROOT/boot/grub2/grub.cfg" ]] && ! grep -q 'console=tty0' "\$ROOT/boot/grub2/grub.cfg"; then
+	sed -i 's/console=ttyS0,115200/console=ttyS0,115200 console=tty0/g' "\$ROOT/boot/grub2/grub.cfg"
+fi
+if [[ -f "\$ROOT/etc/default/grub" ]] && ! grep -q 'console=tty0' "\$ROOT/etc/default/grub"; then
+	sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 console=tty0"/' "\$ROOT/etc/default/grub"
+fi
+if [[ -f "\$ROOT/etc/sysconfig/bootloader" ]] && ! grep -q 'console=tty0' "\$ROOT/etc/sysconfig/bootloader"; then
+	sed -i 's/^\(DEFAULT_APPEND="[^"]*\)"/\1 console=tty0"/; s/^\(FAILSAFE_APPEND="[^"]*\)"/\1 console=tty0"/' "\$ROOT/etc/sysconfig/bootloader"
+fi
 COMBUSTION
 chmod 0700 /run/config/combustion/script
 sync
@@ -666,7 +664,8 @@ run_from_bootstrap() {
 		umount -Rl "$mountpoint" 2>/dev/null || true
 	done
 	# Keep /oldroot mounted until the inner deployer has flushed it and
-	# remounted it read-only. It then detaches the old root before writing.
+	# switched it read-only by blockdev --setro. It then detaches it before
+	# writing the new image.
 	export VPS2LINUX_ROOT_SOURCE="$ROOT_SOURCE"
 	# Run the deployer as a child so the RAM bootstrap shell remains available
 	# while the inner script freezes old userspace processes by name.
