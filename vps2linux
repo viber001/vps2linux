@@ -60,7 +60,8 @@ Options:
   --dns ADDRESS         DNS server(s), separated by commas or semicolons
   --ssh-key-file FILE   authorized_keys source (default: /root/.ssh/authorized_keys)
   --root-size-gib N     Btrfs partition size (default: 64)
-  --config-size-mib N   Combustion partition size (default: 1024)
+  --config-size-mib N   Minimum Combustion partition size (default: 1024);
+                        the partition is extended to the end of the disk
   --execute             Enter the RAM bootstrap and write the target disk
   --dry-run             Print the plan without staging or changing anything
   --stage-test          Stage the RAM bootstrap and syntax-check its deployer
@@ -229,7 +230,7 @@ print_plan() {
 	printf 'raw image:      %s (%s bytes)\n' "$RAW_FILE" "$size_bytes"
 	printf 'target hostname: %s\n' "$TARGET_HOSTNAME"
 	printf 'target network:  %s (%s) names=%s %s via %s DNS %s\n' "$TARGET_INTERFACE" "$TARGET_MAC" "$TARGET_INTERFACE_NAMES" "$TARGET_IPV4_CIDR" "$TARGET_GATEWAY" "${TARGET_DNS:-none}"
-	printf 'root/config:     %s GiB Btrfs / %s MiB Combustion\n' "$ROOT_SIZE_GIB" "$CONFIG_SIZE_MIB"
+	printf 'root/config:     %s GiB Btrfs / Combustion to end of disk (min %s MiB)\n' "$ROOT_SIZE_GIB" "$CONFIG_SIZE_MIB"
 	printf 'SSH keys:        %s\n' "$SSH_KEY_FILE"
 	printf 'raw partition table:\n'
 	sfdisk --dump "$RAW_FILE" 2>/dev/null || warn 'sfdisk could not print the raw image partition table'
@@ -294,6 +295,9 @@ stage_bootstrap() {
 	if command_file=$(command_path efibootmgr); then
 		stage_binary "$command_file"
 	fi
+	if command_file=$(command_path fsfreeze); then
+		stage_binary "$command_file"
+	fi
 	cp -a "$RAW_FILE" "$BOOTSTRAP/run/image.raw"
 	cp -aL "$SSH_KEY_FILE" "$BOOTSTRAP/run/authorized_keys"
 	cat > "$BOOTSTRAP/run/deploy.env" <<EOF
@@ -335,20 +339,19 @@ flush_disk
 # Stop writes from the old LVM-backed root before pivoting away from it.
 for volume in /dev/mapper/*; do
 	[[ -b "$volume" ]] || continue
-		case "$volume" in
-			*/pve-swap|*/pve-data|*/pve-data_tdata|*/pve-data_tmeta) lvchange -an "$volume" 2>/dev/null || true ;;
-		esac
+	case "$volume" in
+		*/pve-swap|*/pve-data|*/pve-data_tdata|*/pve-data_tmeta) lvchange -an "$volume" 2>/dev/null || true ;;
+	esac
 done
 flush_disk
-if [[ -n "${VPS2LINUX_ROOT_SOURCE:-}" && -b "$VPS2LINUX_ROOT_SOURCE" ]]; then
-	blockdev --setro "$VPS2LINUX_ROOT_SOURCE" || fail "cannot make old root read-only: $VPS2LINUX_ROOT_SOURCE"
-fi
-
 # pivot_root does not terminate the old init system. Freeze PID 1 and the
 # old logging, device, PVE and cluster services, otherwise old PVE/Btrfs dirty
 # pages can be written back after dd and corrupt the new raw image. Keep the
 # SSH/bash processes alive so the RAM deployer itself cannot be stopped by a
-# name collision.
+# name collision. watchdog-mux is deliberately NOT frozen: it owns
+# /dev/watchdog and is the only process feeding the hardware watchdog, so
+# stopping it would let the (often short) watchdog timer reset the machine
+# in the middle of the write.
 kill -STOP 1 2>/dev/null || true
 for proc in /proc/[0-9]*; do
 	pid=${proc##*/}
@@ -357,25 +360,41 @@ for proc in /proc/[0-9]*; do
 	case "$comm" in
 		systemd-journal|systemd-udevd|systemd-logind|\
 			pveproxy|pvedaemon|pvestatd|pve-cluster|pve-firewall|pvescheduler|\
-			pmxcfs|qmeventd|corosync|watchdog-mux)
+			pmxcfs|qmeventd|corosync)
 			kill -STOP "$pid" 2>/dev/null || true
 			;;
 	esac
 done
 printf '%s\n' 'Old userspace frozen; continuing with target disk replacement.'
 
-# The old root is still mounted below /oldroot after pivot_root. Flush it
-# once more, remount it read-only, then detach it before touching the disk.
+# The old root is still mounted below /oldroot after pivot_root. Flush it,
+# then freeze the filesystem itself: a frozen filesystem rejects every
+# further write, so the former root cannot write its dirty pages back over
+# the freshly written raw image. fsfreeze must run while the device is still
+# writable, because the flush it performs would otherwise fail; the device
+# is switched to read-only only afterwards.
 flush_disk
-if ! mount -o remount,ro /oldroot 2>/dev/null; then
-	# After pivot_root, some kernels reject a superblock remount because the
-	# old root is still busy. A bind remount still makes this mount read-only;
-	# blockdev --setro above prevents writes through the old root device too.
-	if ! mount -o remount,bind,ro /oldroot 2>/dev/null; then
-		printf '%s\n' 'WARNING: old root remount was rejected; blockdev --setro remains active.' >&2
+FROZEN=0
+if mountpoint -q /oldroot 2>/dev/null; then
+	if fsfreeze --freeze /oldroot 2>/dev/null; then
+		FROZEN=1
+		printf '%s\n' 'Former root filesystem frozen; writeback is disabled.'
 	fi
 fi
-umount -Rl /oldroot || fail 'cannot detach the former target root after remounting it read-only'
+# A read-only remount is a second line of defence. After pivot_root some
+# kernels reject the superblock remount because the old root is still
+# busy; the filesystem freeze above already blocks writeback in that case.
+if (( ! FROZEN )) && mountpoint -q /oldroot 2>/dev/null; then
+	if ! mount -o remount,ro /oldroot 2>/dev/null; then
+		mount -o remount,bind,ro /oldroot 2>/dev/null || \
+			printf '%s\n' 'WARNING: former root could not be made read-only; relying on blockdev --setro.' >&2
+	fi
+fi
+if [[ -n "${VPS2LINUX_ROOT_SOURCE:-}" && -b "$VPS2LINUX_ROOT_SOURCE" ]]; then
+	blockdev --setro "$VPS2LINUX_ROOT_SOURCE" || \
+		printf '%s\n' "WARNING: cannot make old root read-only: $VPS2LINUX_ROOT_SOURCE" >&2
+fi
+umount -Rl /oldroot || fail 'cannot detach the former target root'
 
 for node in $(lsblk -nrpo NAME,TYPE "$DISK" | awk '$2 == "part" { print $1 }'); do
 	[[ -z "$(findmnt -rn -S "$node" || true)" ]] || fail "target partition is still mounted: $node"
@@ -394,7 +413,17 @@ RAW_P2_LINE=$(printf '%s\n' "$RAW_TABLE" | awk -v part="${RAW}2" '$1 == part { p
 RAW_P3_LINE=$(printf '%s\n' "$RAW_TABLE" | awk -v part="${RAW}3" '$1 == part { print; exit }')
 table_field() {
 	local line=$1 key=$2 value
-	value=$(printf '%s\n' "$line" | awk -v key="$key" '{ for (i = 1; i <= NF; i++) if ($i ~ ("^" key "=")) { value = $i; sub("^" key "=", "", value); gsub(/,/, "", value); print value; exit } }')
+	# sfdisk pads values after the '=' (for example "start=     2048,"), so the
+	# value is not necessarily part of the same whitespace-separated field.
+	value=$(printf '%s\n' "$line" | awk -v key="$key" '{
+		if (match($0, key "= *[^, ]+")) {
+			value = substr($0, RSTART, RLENGTH)
+			sub("^" key "= *", "", value)
+			gsub(/,/, "", value)
+			print value
+			exit
+		}
+	}')
 	printf '%s\n' "$value"
 }
 RAW_P1_START=$(table_field "$RAW_P1_LINE" start)
@@ -416,9 +445,16 @@ ROOT_SIZE_SECTORS=$((ROOT_SIZE_GIB * 1024 * 1024 * 1024 / SECTOR_SIZE))
 ALIGN_SECTORS=$((1048576 / SECTOR_SIZE))
 CONFIG_START=$((RAW_ROOT_START + ROOT_SIZE_SECTORS))
 CONFIG_START=$(((CONFIG_START + ALIGN_SECTORS - 1) / ALIGN_SECTORS * ALIGN_SECTORS))
-CONFIG_SIZE=$((CONFIG_SIZE_MIB * 1024 * 1024 / SECTOR_SIZE))
-CONFIG_END=$((CONFIG_START + CONFIG_SIZE - 1))
-(( CONFIG_END < DISK_SECTORS - 34 )) || fail 'root plus Combustion partition do not fit on the target disk'
+	# openSUSE Leap Micro and other KIWI SelfInstall images grow the root
+	# partition to fill any unpartitioned space on the first boot and recreate
+	# kiwi_RootPart immediately after the last partition.  That would move our
+	# root partition and orphan the root filesystem.  Extend the Combustion
+	# partition to the end of the disk so no free space remains and the image's
+	# first-boot repartitioning is skipped.
+	CONFIG_SIZE=$((DISK_SECTORS - 34 - CONFIG_START))
+	(( CONFIG_SIZE >= CONFIG_SIZE_MIB * 1024 * 1024 / SECTOR_SIZE )) || \
+		fail 'not enough free space for the Combustion partition'
+	CONFIG_END=$((CONFIG_START + CONFIG_SIZE - 1))
 case "$DISK" in
 	/dev/nvme*|/dev/mmcblk*|/dev/loop*) CONFIG_PART=${DISK}p4 ;;
 	*) CONFIG_PART=${DISK}4 ;;

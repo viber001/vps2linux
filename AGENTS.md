@@ -64,12 +64,11 @@ http://10.68.247.14:16000/eiso/id/3/
 ```text
 sda1  保留 raw image 的 BIOS 分区和 GUID
 sda2  保留 raw image 的 EFI 分区和 GUID
-sda3  Btrfs root，默认扩展到 64 GiB
-sda4  1 GiB ext4，label=combustion
-剩余空间不分配
+sda3  Btrfs root，默认 `--root-size-gib`（64 GiB）
+sda4  ext4，label=combustion，扩展到磁盘末尾，不留空闲空间
 ```
 
-`sda4` 使用 Leap Micro 的 Combustion 契约，不是通用 cloud-init 分区。配置文件为：
+`sda4` 必须占据 root 之后的全部空间：Leap Micro 的 KIWI 首启会把 root 扩到任意空闲空间并在最后一个分区之后重建 `kiwi_RootPart`，留空闲空间会让首启搬走 root、导致 root 文件系统失联。`sda4` 使用 Leap Micro 的 Combustion 契约，不是通用 cloud-init 分区。配置文件为：
 
 ```text
 /combustion/script

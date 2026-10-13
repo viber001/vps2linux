@@ -27,7 +27,8 @@ http://10.68.247.14:16000/eiso/id/3/
 - 默认只做探测和 dry-run，不写磁盘。
 - 只有同时提供 `--execute` 和 `VPS2LINUX_CONFIRM=WIPE:/dev/...` 才允许擦盘。
 - 目标磁盘上的 LVM、ext4、EFI 和现有分区不能在运行态继续写入；脚本会把部署工具和 raw image 放入 RAM-backed bootstrap，再通过 `pivot_root` 离开旧系统。
-- raw image 自带 EFI、BIOS 和 Btrfs root 分区；写入更大的目标盘后，脚本会用 raw image 的分区定义重建 GPT backup header，保留前三个分区的 GUID，并把 Btrfs root 扩展到 `--root-size-gib`，随后追加 Combustion 配置分区。
+- raw image 自带 EFI、BIOS 和 Btrfs root 分区；写入更大的目标盘后，脚本会用 raw image 的分区定义重建 GPT backup header，保留前三个分区的 GUID，把 Btrfs root 扩展到 `--root-size-gib`，并把 Combustion 配置分区扩展到磁盘末尾。
+- Leap Micro 的 KIWI 首启会把 root 分区扩到任意未分配空间，并在最后一个分区之后重建 `kiwi_RootPart`。如果 root 之后还留有空闲空间，首启就会搬走 root 分区、导致 root 文件系统失联（GRUB 报 `no such device`）。因此 Combustion 配置分区占据 root 之后的全部空间，使首启跳过重分区。
 - 配置分区使用 `combustion` 文件系统标签和 `/combustion/script`；脚本写入 hostname、NetworkManager 静态 IPv4、DNS、root `authorized_keys` 和 SSH 公钥登录配置。PVE 的 `vmbrX` 会先解析到 bridge member，并保存 member 的设备名、`altname` 和 MAC；目标系统优先按 MAC 匹配，其次按保存的名称匹配，最后回退到第一个 `UP` 的非 loopback 网卡。
 - PVE 单节点和 PVE 集群都只按普通 Debian/Linux root 环境检测，不修改 `/etc/pve` 集群配置。
 
@@ -57,7 +58,7 @@ VPS2LINUX_CONFIRM=WIPE:/dev/sda \
   --ssh-key-file /root/.ssh/authorized_keys
 ```
 
-当前版本的执行路径已经在 VM 600 上验证：PVE `ext4+LVM` 可以从 RAM bootstrap 覆盖为 Leap Micro `EFI+Btrfs`，并通过 `efibootmgr` 创建 `vps2linux` 启动项；Combustion 首启已验证静态 IP 和 SSH 公钥登录。c49 的 PVE `Btrfs` root 已通过 dry-run 和 stage-test。
+当前版本的执行路径已经在 VM 600 上验证：PVE `ext4+LVM` 可以从 RAM bootstrap 覆盖为 Leap Micro `EFI+Btrfs`，并通过 `efibootmgr` 创建 `vps2linux` 启动项；Combustion 首启已验证静态 IP 和 SSH 公钥登录。VM 602 的 PVE `Btrfs` root 也已完成端到端验证（400 GiB 目标盘、root 100 GiB、Combustion 填满剩余空间），首启后 hostname、静态 IPv4、SSH 公钥均由 Combustion 生效。
 
 ## 安全边界
 
