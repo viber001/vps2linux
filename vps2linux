@@ -242,7 +242,7 @@ print_plan() {
 
 check_dependencies() {
 	local command_name
-	for command_name in awk blockdev cp dd findmnt lsblk mount readlink rm sha256sum sfdisk stat sync tr umount; do
+	for command_name in awk blockdev cp dd findmnt lsblk mount readlink rm sha256sum sfdisk sgdisk stat sync tr umount; do
 		need_command "$command_name"
 	done
 	for command_name in hostname ip mountpoint paste; do
@@ -285,7 +285,7 @@ stage_bootstrap() {
 	mkdir -p "$BOOTSTRAP"/{dev,proc,sys,run,etc}
 
 	for command_name in bash mount umount sync mkdir rm cp cat grep awk sed tr cut \
-		dd findmnt lsblk sha256sum sfdisk blockdev stat losetup partx blkid \
+		dd findmnt lsblk sha256sum sfdisk sgdisk blockdev stat losetup partx blkid \
 		lvchange vgchange chroot pivot_root reboot mkfs.ext4 chmod; do
 		command_file=$(command_path "$command_name")
 		[[ -n "$command_file" ]] || die "cannot stage command: $command_name"
@@ -322,9 +322,15 @@ fail() {
 	exit 1
 }
 
+flush_disk() {
+	sync
+	blockdev --flushbufs "$DISK" || fail "cannot flush pending writes for $DISK"
+}
+
 printf '%s\n' '=== VPS2LINUX RAM DEPLOYMENT ==='
 [[ "$(lsblk -dnro TYPE "$DISK")" == disk ]] || fail "not a whole disk: $DISK"
 [[ -s "$RAW" ]] || fail 'raw image is missing from the RAM bootstrap'
+flush_disk
 
 # Stop writes from the old LVM-backed root before pivoting away from it.
 for volume in /dev/mapper/*; do
@@ -333,10 +339,43 @@ for volume in /dev/mapper/*; do
 			*/pve-swap|*/pve-data|*/pve-data_tdata|*/pve-data_tmeta) lvchange -an "$volume" 2>/dev/null || true ;;
 		esac
 done
-sync
+flush_disk
 if [[ -n "${VPS2LINUX_ROOT_SOURCE:-}" && -b "$VPS2LINUX_ROOT_SOURCE" ]]; then
 	blockdev --setro "$VPS2LINUX_ROOT_SOURCE" || fail "cannot make old root read-only: $VPS2LINUX_ROOT_SOURCE"
 fi
+
+# pivot_root does not terminate the old init system. Freeze PID 1 and the
+# old logging, device, PVE and cluster services, otherwise old PVE/Btrfs dirty
+# pages can be written back after dd and corrupt the new raw image. Keep the
+# SSH/bash processes alive so the RAM deployer itself cannot be stopped by a
+# name collision.
+kill -STOP 1 2>/dev/null || true
+for proc in /proc/[0-9]*; do
+	pid=${proc##*/}
+	[[ -r "$proc/comm" ]] || continue
+	comm=$(<"$proc/comm")
+	case "$comm" in
+		systemd-journal|systemd-udevd|systemd-logind|\
+			pveproxy|pvedaemon|pvestatd|pve-cluster|pve-firewall|pvescheduler|\
+			pmxcfs|qmeventd|corosync|watchdog-mux)
+			kill -STOP "$pid" 2>/dev/null || true
+			;;
+	esac
+done
+printf '%s\n' 'Old userspace frozen; continuing with target disk replacement.'
+
+# The old root is still mounted below /oldroot after pivot_root. Flush it
+# once more, remount it read-only, then detach it before touching the disk.
+flush_disk
+if ! mount -o remount,ro /oldroot 2>/dev/null; then
+	# After pivot_root, some kernels reject a superblock remount because the
+	# old root is still busy. A bind remount still makes this mount read-only;
+	# blockdev --setro above prevents writes through the old root device too.
+	if ! mount -o remount,bind,ro /oldroot 2>/dev/null; then
+		printf '%s\n' 'WARNING: old root remount was rejected; blockdev --setro remains active.' >&2
+	fi
+fi
+umount -Rl /oldroot || fail 'cannot detach the former target root after remounting it read-only'
 
 for node in $(lsblk -nrpo NAME,TYPE "$DISK" | awk '$2 == "part" { print $1 }'); do
 	[[ -z "$(findmnt -rn -S "$node" || true)" ]] || fail "target partition is still mounted: $node"
@@ -346,30 +385,36 @@ printf 'Writing %s to %s\n' "$RAW" "$DISK"
 dd if="$RAW" of="$DISK" bs=16M conv=fsync status=progress
 sync
 
-# A raw image carries a GPT backup header at the end of the image, not at the
-# end of a larger target disk.  Rebuild the table from the raw definition,
-# omitting the image-size last-lba so sfdisk places the backup header at the
-# actual target-disk end.  Partition GUIDs and the Btrfs partition size remain
-# those from the image; unused space is intentionally left unallocated.
-sfdisk --dump "$RAW" | awk -v raw="$RAW" -v disk="$DISK" \
-	-v root_size="$((ROOT_SIZE_GIB * 1024 * 1024 * 1024 / 512))" '
-	/^device:/ { print "device: " disk; next }
-	/^(first-lba|last-lba|grain|sector-size):/ { next }
-	index($0, raw "3") == 1 {
-		sub(/size=[[:space:]]*[0-9]+/, "size= " root_size)
-		print disk substr($0, length(raw) + 1)
-		next
-	}
-	index($0, raw) == 1 { print disk substr($0, length(raw) + 1); next }
-	{ print }
-' > /run/rebased-gpt
-
 SECTOR_SIZE=$(sfdisk --dump "$RAW" | awk '/^sector-size:/ { print $2; exit }')
 DISK_SECTORS=$(blockdev --getsz "$DISK")
-RAW_ROOT_START=$(sfdisk --dump "$RAW" | awk -v part="${RAW}3" '$1 == part { gsub(/,/, "", $4); print $4; exit }')
+RAW_TABLE=$(sfdisk --dump "$RAW")
+RAW_DISK_GUID=$(printf '%s\n' "$RAW_TABLE" | awk '/^label-id:/ { print $2; exit }')
+RAW_P1_LINE=$(printf '%s\n' "$RAW_TABLE" | awk -v part="${RAW}1" '$1 == part { print; exit }')
+RAW_P2_LINE=$(printf '%s\n' "$RAW_TABLE" | awk -v part="${RAW}2" '$1 == part { print; exit }')
+RAW_P3_LINE=$(printf '%s\n' "$RAW_TABLE" | awk -v part="${RAW}3" '$1 == part { print; exit }')
+table_field() {
+	local line=$1 key=$2 value
+	value=$(printf '%s\n' "$line" | awk -v key="$key" '{ for (i = 1; i <= NF; i++) if ($i ~ ("^" key "=")) { value = $i; sub("^" key "=", "", value); gsub(/,/, "", value); print value; exit } }')
+	printf '%s\n' "$value"
+}
+RAW_P1_START=$(table_field "$RAW_P1_LINE" start)
+RAW_P1_SIZE=$(table_field "$RAW_P1_LINE" size)
+RAW_P1_TYPE=$(table_field "$RAW_P1_LINE" type)
+RAW_P1_UUID=$(table_field "$RAW_P1_LINE" uuid)
+RAW_P2_START=$(table_field "$RAW_P2_LINE" start)
+RAW_P2_SIZE=$(table_field "$RAW_P2_LINE" size)
+RAW_P2_TYPE=$(table_field "$RAW_P2_LINE" type)
+RAW_P2_UUID=$(table_field "$RAW_P2_LINE" uuid)
+RAW_ROOT_START=$(table_field "$RAW_P3_LINE" start)
+RAW_P3_TYPE=$(table_field "$RAW_P3_LINE" type)
+RAW_P3_UUID=$(table_field "$RAW_P3_LINE" uuid)
 [[ "$SECTOR_SIZE" =~ ^[0-9]+$ && "$RAW_ROOT_START" =~ ^[0-9]+$ ]] || fail 'cannot calculate the Combustion partition offset'
+[[ -n "$RAW_DISK_GUID" && -n "$RAW_P1_START" && -n "$RAW_P1_SIZE" && -n "$RAW_P1_TYPE" && -n "$RAW_P1_UUID" && \
+	-n "$RAW_P2_START" && -n "$RAW_P2_SIZE" && -n "$RAW_P2_TYPE" && -n "$RAW_P2_UUID" && \
+	-n "$RAW_P3_TYPE" && -n "$RAW_P3_UUID" ]] || fail 'cannot read the raw image GPT metadata'
+ROOT_SIZE_SECTORS=$((ROOT_SIZE_GIB * 1024 * 1024 * 1024 / SECTOR_SIZE))
 ALIGN_SECTORS=$((1048576 / SECTOR_SIZE))
-CONFIG_START=$((RAW_ROOT_START + ROOT_SIZE_GIB * 1024 * 1024 * 1024 / SECTOR_SIZE))
+CONFIG_START=$((RAW_ROOT_START + ROOT_SIZE_SECTORS))
 CONFIG_START=$(((CONFIG_START + ALIGN_SECTORS - 1) / ALIGN_SECTORS * ALIGN_SECTORS))
 CONFIG_SIZE=$((CONFIG_SIZE_MIB * 1024 * 1024 / SECTOR_SIZE))
 CONFIG_END=$((CONFIG_START + CONFIG_SIZE - 1))
@@ -378,11 +423,27 @@ case "$DISK" in
 	/dev/nvme*|/dev/mmcblk*|/dev/loop*) CONFIG_PART=${DISK}p4 ;;
 	*) CONFIG_PART=${DISK}4 ;;
 esac
-printf '%s : start= %s, size= %s, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4\n' \
-	"$CONFIG_PART" "$CONFIG_START" "$CONFIG_SIZE" >> /run/rebased-gpt
-sfdisk --no-reread --force "$DISK" < /run/rebased-gpt
+# The old kernel partition devices can survive dd and keep sfdisk from
+# replacing an in-use partition entry. Remove those stale mappings before
+# writing the new on-disk GPT with sgdisk.
+partx -d "$DISK" 2>/dev/null || true
+sgdisk --zap-all "$DISK"
+sgdisk \
+	--disk-guid="$RAW_DISK_GUID" \
+	--new=1:"$RAW_P1_START":"$((RAW_P1_START + RAW_P1_SIZE - 1))" \
+	--typecode=1:"$RAW_P1_TYPE" --partition-guid=1:"$RAW_P1_UUID" --change-name=1:p.legacy \
+	--new=2:"$RAW_P2_START":"$((RAW_P2_START + RAW_P2_SIZE - 1))" \
+	--typecode=2:"$RAW_P2_TYPE" --partition-guid=2:"$RAW_P2_UUID" --change-name=2:p.UEFI \
+	--new=3:"$RAW_ROOT_START":"$((RAW_ROOT_START + ROOT_SIZE_SECTORS - 1))" \
+	--typecode=3:"$RAW_P3_TYPE" --partition-guid=3:"$RAW_P3_UUID" --change-name=3:p.lxroot \
+	--new=4:"$CONFIG_START":"$CONFIG_END" \
+	--typecode=4:0FC63DAF-8483-4772-8E79-3D69D8477DE4 --change-name=4:combustion \
+	"$DISK"
 sync
-sfdisk --verify "$DISK" || fail "the target GPT failed verification: $DISK"
+sgdisk --verify "$DISK" || fail "the target GPT failed verification: $DISK"
+ACTUAL_ROOT=$(sfdisk --dump "$DISK" | awk -v part="${DISK}3" '$1 == part { gsub(/,/, "", $4); gsub(/,/, "", $6); print $4 " " $6; exit }')
+[[ "$ACTUAL_ROOT" == "$RAW_ROOT_START $ROOT_SIZE_SECTORS" ]] || \
+	fail "target GPT root partition mismatch: expected $RAW_ROOT_START/$ROOT_SIZE_SECTORS, got ${ACTUAL_ROOT:-missing}"
 
 CONFIG_OFFSET=$((CONFIG_START * SECTOR_SIZE))
 CONFIG_BYTES=$((CONFIG_SIZE * SECTOR_SIZE))
@@ -530,15 +591,15 @@ if [[ -d /sys/firmware/efi ]]; then
 else
 	printf '%s\n' 'UEFI runtime unavailable; relying on the EFI fallback path or BIOS boot code.'
 fi
-sync
-printf '%s\n' 'Raw image written. Rebooting into the new system.'
+	flush_disk
+	printf '%s\n' 'Raw image written. Rebooting into the new system.'
 reboot -f
 INNER
 	chmod 0755 "$BOOTSTRAP/run/deploy"
 }
 
 run_from_bootstrap() {
-	local oldroot="$BOOTSTRAP/oldroot"
+	local oldroot="$BOOTSTRAP/oldroot" mountpoint node type
 	local node type mountpoint
 	# EFI (/boot/efi) and any separate /boot partition must be detached before
 	# the target disk is overwritten.  The inner check remains as a second
@@ -547,6 +608,9 @@ run_from_bootstrap() {
 		[[ "$type" == part ]] || continue
 		while read -r mountpoint; do
 			[[ -n "$mountpoint" ]] || continue
+			# The active root must move through pivot_root first.  It cannot be
+			# unmounted while this shell is still running from that root.
+			[[ "$mountpoint" == / ]] && continue
 			umount -Rl "$mountpoint" 2>/dev/null || umount -l "$mountpoint" 2>/dev/null || \
 				die "cannot detach target mount: $node at $mountpoint"
 		done < <(findmnt -rn -S "$node" -o TARGET)
@@ -565,8 +629,12 @@ run_from_bootstrap() {
 	for mountpoint in /oldroot/dev /oldroot/proc /oldroot/sys; do
 		umount -Rl "$mountpoint" 2>/dev/null || true
 	done
+	# Keep /oldroot mounted until the inner deployer has flushed it and
+	# remounted it read-only. It then detaches the old root before writing.
 	export VPS2LINUX_ROOT_SOURCE="$ROOT_SOURCE"
-	exec /usr/bin/bash /run/deploy "$TARGET_DISK"
+	# Run the deployer as a child so the RAM bootstrap shell remains available
+	# while the inner script freezes old userspace processes by name.
+	/usr/bin/bash /run/deploy "$TARGET_DISK"
 }
 
 parse_args() {

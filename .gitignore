@@ -1,0 +1,3 @@
+# Local handoff notes may contain internal infrastructure details.
+AGENTS.private.md
+*.private.md
