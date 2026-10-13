@@ -6,6 +6,24 @@
 
 这是一个破坏性实验工具，默认只执行探测和 dry-run。不要把它当作通用安装器或在线升级工具。
 
+## 使用背景
+
+当前项目用于间接部署：
+
+```text
+openSUSE-Leap-Micro.x86_64-6.2-Default-SelfInstall-Build12.9.install.iso
+```
+
+iVentoy 的 PXE 流程不直接支持这个 SelfInstall ISO，因此使用 iVentoy 提供的 EISO HTTP 内容取得其中的 Leap Micro raw image，再由当前 Linux 的 RAM bootstrap 部署到目标整盘。
+
+iVentoy EISO 目录：
+
+```text
+http://10.68.247.14:16000/eiso/id/3/
+```
+
+镜像具体 URL 和 SHA256 应通过参数提供，不要把部署环境之外的地址固定到脚本逻辑中。
+
 ## 仓库约定
 
 - 当前开发分支为 `main`。

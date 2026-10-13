@@ -4,6 +4,24 @@
 
 当前目标是验证 openSUSE Leap Micro SelfInstall raw image 在 PVE/Debian 环境中的安全替换流程。
 
+## 使用背景
+
+当前目标安装介质是：
+
+```text
+openSUSE-Leap-Micro.x86_64-6.2-Default-SelfInstall-Build12.9.install.iso
+```
+
+iVentoy 的 PXE 流程不直接支持这个 SelfInstall ISO，因此本项目采用间接方式：使用 iVentoy 提供的 EISO HTTP 内容获取安装介质中的 Leap Micro raw image，再由 `vps2linux` 从当前 Linux 的 RAM bootstrap 环境部署到目标整盘。
+
+对应的 iVentoy EISO 目录是：
+
+```text
+http://10.68.247.14:16000/eiso/id/3/
+```
+
+该目录由 iVentoy 提供，镜像的具体 URL 和 SHA256 作为命令行参数传入，不在脚本中固定。
+
 ## 设计原则
 
 - 默认只做探测和 dry-run，不写磁盘。
