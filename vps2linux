@@ -1,0 +1,631 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# vps2linux - replace a running Linux installation with a raw Linux image.
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# The destructive part is deliberately split into a RAM-backed bootstrap.  A
+# running root filesystem must never write its own disk while that disk is
+# being replaced.
+
+umask 077
+
+PROGRAM=${0##*/}
+WORKDIR=${VPS2LINUX_WORKDIR:-/var/tmp/vps2linux}
+IMAGE_URL=${VPS2LINUX_IMAGE_URL:-}
+IMAGE_FILE=${VPS2LINUX_IMAGE_FILE:-}
+IMAGE_SHA256=${VPS2LINUX_IMAGE_SHA256:-}
+TARGET_DISK=${VPS2LINUX_DISK:-}
+TARGET_HOSTNAME=${VPS2LINUX_HOSTNAME:-}
+TARGET_INTERFACE=${VPS2LINUX_INTERFACE:-}
+TARGET_INTERFACE_NAMES=${VPS2LINUX_INTERFACE_NAMES:-}
+TARGET_MAC=${VPS2LINUX_MAC:-}
+TARGET_IPV4_CIDR=${VPS2LINUX_IPV4_CIDR:-}
+TARGET_GATEWAY=${VPS2LINUX_GATEWAY:-}
+TARGET_DNS=${VPS2LINUX_DNS:-}
+SSH_KEY_FILE=${VPS2LINUX_SSH_KEY_FILE:-/root/.ssh/authorized_keys}
+ROOT_SIZE_GIB=${VPS2LINUX_ROOT_SIZE_GIB:-64}
+CONFIG_SIZE_MIB=${VPS2LINUX_CONFIG_SIZE_MIB:-1024}
+RAW_FILE=
+ROOT_SOURCE=
+SOURCE_DISK=
+BOOTSTRAP=/run/vps2linux-bootstrap
+
+die() {
+	printf 'FATAL: %s\n' "$*" >&2
+	exit 1
+}
+
+warn() {
+	printf 'WARNING: %s\n' "$*" >&2
+}
+
+usage() {
+	cat <<EOF
+Usage: $PROGRAM [options]
+
+Discover and replace the current Linux installation with a raw image.
+The default action is a read-only plan.  --execute requires an exact
+VPS2LINUX_CONFIRM value before any disk is written.
+
+Options:
+  --image-url URL       Raw image or SquashFS URL
+  --image-file FILE     Local raw image or SquashFS file
+  --sha256 HASH         Expected SHA-256 of the raw image
+  --disk DEVICE         Target whole disk (default: disk containing /)
+  --hostname NAME       Hostname written by Combustion
+  --interface NAME      Source/default network interface
+  --ipv4 CIDR           Static IPv4 address, for example 10.0.0.20/24
+  --gateway ADDRESS     IPv4 gateway written by Combustion
+  --dns ADDRESS         DNS server(s), separated by commas or semicolons
+  --ssh-key-file FILE   authorized_keys source (default: /root/.ssh/authorized_keys)
+  --root-size-gib N     Btrfs partition size (default: 64)
+  --config-size-mib N   Combustion partition size (default: 1024)
+  --execute             Enter the RAM bootstrap and write the target disk
+  --dry-run             Print the plan without staging or changing anything
+  --stage-test          Stage the RAM bootstrap and syntax-check its deployer
+  -h, --help            Show this help
+
+Examples:
+  $PROGRAM --image-url http://10.68.247.14:16000/eiso/id/3/openSUSE-Leap-Micro.raw.squashfs
+  VPS2LINUX_CONFIRM=WIPE:/dev/sda $PROGRAM --execute \\
+    --image-file /run/leap-micro.raw --disk /dev/sda
+
+The configuration partition uses the Leap Micro Combustion contract:
+filesystem label "combustion" and /combustion/script. It is not a generic
+cloud-init disk; the script writes hostname, networking and root SSH keys.
+EOF
+}
+
+command_path() {
+	command -v "$1" 2>/dev/null || return 1
+}
+
+need_command() {
+	command_path "$1" >/dev/null || die "required command is missing: $1"
+}
+
+partition_path() {
+	case "$1" in
+		/dev/nvme*|/dev/mmcblk*|/dev/loop*) printf '%sp%s\n' "$1" "$2" ;;
+		*) printf '%s%s\n' "$1" "$2" ;;
+	esac
+}
+
+download_file() {
+	local url=$1 destination=$2
+	if command -v curl >/dev/null 2>&1; then
+		curl --fail --location --retry 3 --output "$destination" "$url"
+	elif command -v wget >/dev/null 2>&1; then
+		wget --tries=3 --output-document="$destination" "$url"
+	else
+		die 'curl or wget is required to download the image'
+	fi
+}
+
+prepare_image() {
+	local archive raw_candidate
+	mkdir -p "$WORKDIR"
+
+	if [[ -n "$IMAGE_FILE" ]]; then
+		[[ -f "$IMAGE_FILE" ]] || die "image file does not exist: $IMAGE_FILE"
+		archive=$IMAGE_FILE
+	else
+		[[ -n "$IMAGE_URL" ]] || die 'provide --image-url or --image-file'
+		archive="$WORKDIR/image.download"
+		printf 'Downloading image: %s\n' "$IMAGE_URL"
+		download_file "$IMAGE_URL" "$archive"
+	fi
+
+	if [[ "$archive" == *.raw ]]; then
+		RAW_FILE="$WORKDIR/image.raw"
+		if [[ "$archive" != "$RAW_FILE" ]]; then
+			cp -f "$archive" "$RAW_FILE"
+		fi
+	else
+		need_command unsquashfs
+		local extract="$WORKDIR/extracted"
+		rm -rf "$extract"
+		mkdir -p "$extract"
+		unsquashfs -f -d "$extract" "$archive" >/dev/null
+		raw_candidate=$(find "$extract" -type f -name '*.raw' -print -quit)
+		[[ -n "$raw_candidate" ]] || die 'the image archive does not contain a .raw image'
+		RAW_FILE="$WORKDIR/image.raw"
+		cp -f "$raw_candidate" "$RAW_FILE"
+	fi
+
+	[[ -s "$RAW_FILE" ]] || die 'the extracted raw image is empty'
+	if [[ -n "$IMAGE_SHA256" ]]; then
+		printf '%s  %s\n' "$IMAGE_SHA256" "$RAW_FILE" | sha256sum -c -
+	fi
+}
+
+discover_source() {
+	ROOT_SOURCE=$(findmnt -nro SOURCE /) || die 'cannot determine the current root source'
+	SOURCE_DISK=$(lsblk -sno PATH,TYPE "$ROOT_SOURCE" | awk '$2 == "disk" { print $1; exit }')
+	[[ -n "$SOURCE_DISK" ]] || die "cannot determine the disk containing $ROOT_SOURCE"
+	[[ -n "$TARGET_DISK" ]] || TARGET_DISK=$SOURCE_DISK
+	[[ "$(lsblk -dnro TYPE "$TARGET_DISK")" == disk ]] || die "$TARGET_DISK is not a whole disk"
+}
+
+discover_configuration() {
+	local nameserver bridge_member altname
+	[[ -n "$TARGET_HOSTNAME" ]] || TARGET_HOSTNAME=$(hostname -s)
+	[[ -n "$TARGET_INTERFACE" ]] || TARGET_INTERFACE=$(ip -4 route show default | awk 'NR == 1 { print $5; exit }')
+	[[ -n "$TARGET_INTERFACE" ]] || die 'cannot determine the default network interface; set --interface'
+	# A PVE host's vmbrX is not a deployable interface. Resolve its physical
+	# bridge member first, then preserve the member name and all kernel altnames.
+	if [[ "$TARGET_INTERFACE" == vmbr* ]]; then
+		bridge_member=$(ip -o link show master "$TARGET_INTERFACE" | awk -F': |@' 'NR == 1 { print $2; exit }')
+		if [[ -n "$bridge_member" ]]; then
+			warn "mapping source bridge $TARGET_INTERFACE to target interface $bridge_member"
+			TARGET_INTERFACE=$bridge_member
+		else
+			warn "source bridge $TARGET_INTERFACE has no visible member; target will use fallback discovery"
+		fi
+	fi
+	[[ -n "$TARGET_INTERFACE_NAMES" ]] || TARGET_INTERFACE_NAMES=$TARGET_INTERFACE
+	while read -r altname; do
+		[[ -n "$altname" ]] || continue
+		case ",$TARGET_INTERFACE_NAMES," in
+			*,"$altname",*) ;;
+			*) TARGET_INTERFACE_NAMES="$TARGET_INTERFACE_NAMES,$altname" ;;
+		esac
+	done < <(ip -o link show dev "$TARGET_INTERFACE" | awk '{ for (i = 1; i <= NF; i++) if ($i == "altname") { name = $(i + 1); sub(/\\$/, "", name); print name } }')
+	if [[ -z "$TARGET_MAC" ]]; then
+		[[ -r "/sys/class/net/$TARGET_INTERFACE/address" ]] || die "cannot determine MAC address for $TARGET_INTERFACE"
+		TARGET_MAC=$(cat "/sys/class/net/$TARGET_INTERFACE/address")
+	fi
+	TARGET_MAC=$(printf '%s' "$TARGET_MAC" | tr '[:upper:]' '[:lower:]')
+	[[ -n "$TARGET_IPV4_CIDR" ]] || \
+		TARGET_IPV4_CIDR=$(ip -4 -o addr show dev "$TARGET_INTERFACE" scope global | awk 'NR == 1 { print $4; exit }')
+	[[ -n "$TARGET_IPV4_CIDR" ]] || die 'cannot determine the current IPv4 address; set --ipv4'
+	[[ -n "$TARGET_GATEWAY" ]] || \
+		TARGET_GATEWAY=$(ip -4 route show default dev "$TARGET_INTERFACE" | awk 'NR == 1 { print $3; exit }')
+	[[ -n "$TARGET_GATEWAY" ]] || die 'cannot determine the default gateway; set --gateway'
+	if [[ -z "$TARGET_DNS" ]]; then
+		nameserver=$(awk '/^nameserver[[:space:]]+/ { print $2 }' /etc/resolv.conf | paste -sd ';' -)
+		TARGET_DNS=$nameserver
+	fi
+	TARGET_DNS=${TARGET_DNS//,/;}
+	TARGET_DNS=${TARGET_DNS// /;}
+	[[ "$TARGET_DNS" == '' || "$TARGET_DNS" == *';' ]] || TARGET_DNS+=';'
+
+	[[ "$TARGET_HOSTNAME" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$ ]] || \
+		die "invalid target hostname: $TARGET_HOSTNAME"
+	[[ "$TARGET_INTERFACE" =~ ^[A-Za-z0-9_.:-]+$ ]] || \
+		die "invalid target interface: $TARGET_INTERFACE"
+	[[ "$TARGET_INTERFACE_NAMES" =~ ^[A-Za-z0-9_.:-]+(,[A-Za-z0-9_.:-]+)*$ ]] || \
+		die "invalid target interface names: $TARGET_INTERFACE_NAMES"
+	[[ "$TARGET_MAC" =~ ^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$ ]] || \
+		die "invalid target MAC address: $TARGET_MAC"
+	[[ "$TARGET_IPV4_CIDR" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || \
+		die "invalid target IPv4 CIDR: $TARGET_IPV4_CIDR"
+	[[ "$TARGET_GATEWAY" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || \
+		die "invalid target gateway: $TARGET_GATEWAY"
+	[[ "$ROOT_SIZE_GIB" =~ ^[1-9][0-9]*$ ]] || die "invalid root size: $ROOT_SIZE_GIB GiB"
+	[[ "$CONFIG_SIZE_MIB" =~ ^[1-9][0-9]*$ ]] || die "invalid config size: $CONFIG_SIZE_MIB MiB"
+	[[ -s "$SSH_KEY_FILE" ]] || die "SSH authorized_keys file is missing or empty: $SSH_KEY_FILE"
+}
+
+check_target_mounts() {
+	local node type mount_source
+	while read -r node type; do
+		[[ "$type" == part ]] || continue
+		mount_source=$(findmnt -rn -S "$node" || true)
+		[[ -z "$mount_source" ]] || die "target partition is mounted: $node ($mount_source)"
+	done < <(lsblk -nrpo NAME,TYPE "$TARGET_DISK")
+}
+
+print_plan() {
+	local size_bytes disk_bytes model
+	size_bytes=$(stat -c '%s' "$RAW_FILE")
+	disk_bytes=$(blockdev --getsize64 "$TARGET_DISK")
+	model=$(lsblk -dnro MODEL "$TARGET_DISK" | sed 's/[[:space:]]*$//')
+	printf '%s\n' '=== VPS2LINUX PLAN ==='
+	printf 'source root:    %s (%s)\n' "$ROOT_SOURCE" "$(findmnt -nro FSTYPE /)"
+	printf 'source disk:    %s\n' "$SOURCE_DISK"
+	printf 'target disk:    %s (%s bytes, %s)\n' "$TARGET_DISK" "$disk_bytes" "${model:-unknown model}"
+	printf 'raw image:      %s (%s bytes)\n' "$RAW_FILE" "$size_bytes"
+	printf 'target hostname: %s\n' "$TARGET_HOSTNAME"
+	printf 'target network:  %s (%s) names=%s %s via %s DNS %s\n' "$TARGET_INTERFACE" "$TARGET_MAC" "$TARGET_INTERFACE_NAMES" "$TARGET_IPV4_CIDR" "$TARGET_GATEWAY" "${TARGET_DNS:-none}"
+	printf 'root/config:     %s GiB Btrfs / %s MiB Combustion\n' "$ROOT_SIZE_GIB" "$CONFIG_SIZE_MIB"
+	printf 'SSH keys:        %s\n' "$SSH_KEY_FILE"
+	printf 'raw partition table:\n'
+	sfdisk --dump "$RAW_FILE" 2>/dev/null || warn 'sfdisk could not print the raw image partition table'
+	if [[ "$SOURCE_DISK" == "$TARGET_DISK" ]]; then
+		printf '%s\n' 'The target is the current system disk.'
+	else
+		printf '%s\n' 'The target is different from the current system disk.'
+	fi
+}
+
+check_dependencies() {
+	local command_name
+	for command_name in awk blockdev cp dd findmnt lsblk mount readlink rm sha256sum sfdisk stat sync tr umount; do
+		need_command "$command_name"
+	done
+	for command_name in hostname ip mountpoint paste; do
+		need_command "$command_name"
+	done
+}
+
+stage_binary() {
+	local source=$1 real dependency dependency_real
+	real=$(readlink -f "$source")
+	[[ -x "$real" ]] || die "cannot stage executable: $source"
+	mkdir -p "$BOOTSTRAP$(dirname "$source")" "$BOOTSTRAP$(dirname "$real")"
+	# Resolve Debian alternatives/symlink entry points inside the bootstrap;
+	# copying the absolute symlink alone would point back at the old root.
+	cp -aL "$source" "$BOOTSTRAP$source"
+	cp -a "$real" "$BOOTSTRAP$real"
+	while read -r dependency; do
+		[[ -z "$dependency" || "$dependency" == linux-vdso* ]] && continue
+		[[ -e "$dependency" || -L "$dependency" ]] || continue
+		mkdir -p "$BOOTSTRAP$(dirname "$dependency")"
+		cp -aL "$dependency" "$BOOTSTRAP$dependency"
+		dependency_real=$(readlink -f "$dependency")
+		if [[ -e "$dependency_real" ]]; then
+			mkdir -p "$BOOTSTRAP$(dirname "$dependency_real")"
+			cp -a "$dependency_real" "$BOOTSTRAP$dependency_real"
+		fi
+	done < <(ldd "$real" 2>/dev/null | awk '/=> \/[^ ]+/ { print $3 } /^[[:space:]]*\/[^ ]+/ { print $1 }')
+}
+
+stage_bootstrap() {
+	local command_name command_file raw_size bootstrap_size
+	raw_size=$(stat -c '%s' "$RAW_FILE")
+	bootstrap_size=$((raw_size + 1073741824))
+	if mountpoint -q "$BOOTSTRAP" 2>/dev/null; then
+		umount -Rl "$BOOTSTRAP" || die "cannot clean old bootstrap: $BOOTSTRAP"
+	fi
+	rm -rf "$BOOTSTRAP"
+	mkdir -p "$BOOTSTRAP"
+	mount -t tmpfs -o "size=${bootstrap_size},mode=755" tmpfs "$BOOTSTRAP"
+	mkdir -p "$BOOTSTRAP"/{dev,proc,sys,run,etc}
+
+	for command_name in bash mount umount sync mkdir rm cp cat grep awk sed tr cut \
+		dd findmnt lsblk sha256sum sfdisk blockdev stat losetup partx blkid \
+		lvchange vgchange chroot pivot_root reboot mkfs.ext4 chmod; do
+		command_file=$(command_path "$command_name")
+		[[ -n "$command_file" ]] || die "cannot stage command: $command_name"
+		stage_binary "$command_file"
+	done
+	if command_file=$(command_path efibootmgr); then
+		stage_binary "$command_file"
+	fi
+	cp -a "$RAW_FILE" "$BOOTSTRAP/run/image.raw"
+	cp -aL "$SSH_KEY_FILE" "$BOOTSTRAP/run/authorized_keys"
+	cat > "$BOOTSTRAP/run/deploy.env" <<EOF
+TARGET_HOSTNAME=$(printf '%q' "$TARGET_HOSTNAME")
+TARGET_INTERFACE=$(printf '%q' "$TARGET_INTERFACE")
+TARGET_INTERFACE_NAMES='$TARGET_INTERFACE_NAMES'
+TARGET_MAC=$(printf '%q' "$TARGET_MAC")
+TARGET_IPV4_CIDR=$(printf '%q' "$TARGET_IPV4_CIDR")
+TARGET_GATEWAY=$(printf '%q' "$TARGET_GATEWAY")
+TARGET_DNS=$(printf '%q' "$TARGET_DNS")
+ROOT_SIZE_GIB=$(printf '%q' "$ROOT_SIZE_GIB")
+CONFIG_SIZE_MIB=$(printf '%q' "$CONFIG_SIZE_MIB")
+EOF
+	cat > "$BOOTSTRAP/run/deploy" <<'INNER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+DISK=${1:?target disk is required}
+RAW=/run/image.raw
+. /run/deploy.env
+
+AUTHORIZED_KEYS=$(cat /run/authorized_keys)
+
+fail() {
+	printf 'FATAL: %s\n' "$*" >&2
+	exit 1
+}
+
+printf '%s\n' '=== VPS2LINUX RAM DEPLOYMENT ==='
+[[ "$(lsblk -dnro TYPE "$DISK")" == disk ]] || fail "not a whole disk: $DISK"
+[[ -s "$RAW" ]] || fail 'raw image is missing from the RAM bootstrap'
+
+# Stop writes from the old LVM-backed root before pivoting away from it.
+for volume in /dev/mapper/*; do
+	[[ -b "$volume" ]] || continue
+		case "$volume" in
+			*/pve-swap|*/pve-data|*/pve-data_tdata|*/pve-data_tmeta) lvchange -an "$volume" 2>/dev/null || true ;;
+		esac
+done
+sync
+if [[ -n "${VPS2LINUX_ROOT_SOURCE:-}" && -b "$VPS2LINUX_ROOT_SOURCE" ]]; then
+	blockdev --setro "$VPS2LINUX_ROOT_SOURCE" || fail "cannot make old root read-only: $VPS2LINUX_ROOT_SOURCE"
+fi
+
+for node in $(lsblk -nrpo NAME,TYPE "$DISK" | awk '$2 == "part" { print $1 }'); do
+	[[ -z "$(findmnt -rn -S "$node" || true)" ]] || fail "target partition is still mounted: $node"
+done
+
+printf 'Writing %s to %s\n' "$RAW" "$DISK"
+dd if="$RAW" of="$DISK" bs=16M conv=fsync status=progress
+sync
+
+# A raw image carries a GPT backup header at the end of the image, not at the
+# end of a larger target disk.  Rebuild the table from the raw definition,
+# omitting the image-size last-lba so sfdisk places the backup header at the
+# actual target-disk end.  Partition GUIDs and the Btrfs partition size remain
+# those from the image; unused space is intentionally left unallocated.
+sfdisk --dump "$RAW" | awk -v raw="$RAW" -v disk="$DISK" \
+	-v root_size="$((ROOT_SIZE_GIB * 1024 * 1024 * 1024 / 512))" '
+	/^device:/ { print "device: " disk; next }
+	/^(first-lba|last-lba|grain|sector-size):/ { next }
+	index($0, raw "3") == 1 {
+		sub(/size=[[:space:]]*[0-9]+/, "size= " root_size)
+		print disk substr($0, length(raw) + 1)
+		next
+	}
+	index($0, raw) == 1 { print disk substr($0, length(raw) + 1); next }
+	{ print }
+' > /run/rebased-gpt
+
+SECTOR_SIZE=$(sfdisk --dump "$RAW" | awk '/^sector-size:/ { print $2; exit }')
+DISK_SECTORS=$(blockdev --getsz "$DISK")
+RAW_ROOT_START=$(sfdisk --dump "$RAW" | awk -v part="${RAW}3" '$1 == part { gsub(/,/, "", $4); print $4; exit }')
+[[ "$SECTOR_SIZE" =~ ^[0-9]+$ && "$RAW_ROOT_START" =~ ^[0-9]+$ ]] || fail 'cannot calculate the Combustion partition offset'
+ALIGN_SECTORS=$((1048576 / SECTOR_SIZE))
+CONFIG_START=$((RAW_ROOT_START + ROOT_SIZE_GIB * 1024 * 1024 * 1024 / SECTOR_SIZE))
+CONFIG_START=$(((CONFIG_START + ALIGN_SECTORS - 1) / ALIGN_SECTORS * ALIGN_SECTORS))
+CONFIG_SIZE=$((CONFIG_SIZE_MIB * 1024 * 1024 / SECTOR_SIZE))
+CONFIG_END=$((CONFIG_START + CONFIG_SIZE - 1))
+(( CONFIG_END < DISK_SECTORS - 34 )) || fail 'root plus Combustion partition do not fit on the target disk'
+case "$DISK" in
+	/dev/nvme*|/dev/mmcblk*|/dev/loop*) CONFIG_PART=${DISK}p4 ;;
+	*) CONFIG_PART=${DISK}4 ;;
+esac
+printf '%s : start= %s, size= %s, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4\n' \
+	"$CONFIG_PART" "$CONFIG_START" "$CONFIG_SIZE" >> /run/rebased-gpt
+sfdisk --no-reread --force "$DISK" < /run/rebased-gpt
+sync
+sfdisk --verify "$DISK" || fail "the target GPT failed verification: $DISK"
+
+CONFIG_OFFSET=$((CONFIG_START * SECTOR_SIZE))
+CONFIG_BYTES=$((CONFIG_SIZE * SECTOR_SIZE))
+CONFIG_LOOP=$(losetup --find --show --offset "$CONFIG_OFFSET" --sizelimit "$CONFIG_BYTES" "$DISK") || \
+	fail 'cannot create a loop device for the Combustion partition'
+cleanup_config() {
+	umount /run/config 2>/dev/null || true
+	losetup -d "$CONFIG_LOOP" 2>/dev/null || true
+}
+trap cleanup_config EXIT
+mkfs.ext4 -F -L combustion "$CONFIG_LOOP"
+mkdir -p /run/config
+mount "$CONFIG_LOOP" /run/config
+mkdir -p /run/config/combustion
+cat > /run/config/combustion/script <<COMBUSTION
+#!/bin/bash
+set -euxo pipefail
+
+if [[ -d /sysroot/etc ]]; then
+	ROOT=/sysroot
+else
+	ROOT=/
+fi
+echo '$TARGET_HOSTNAME' > "\$ROOT/etc/hostname"
+
+mkdir -p "\$ROOT/etc/NetworkManager/system-connections"
+cat > "\$ROOT/etc/NetworkManager/system-connections/vps2linux.nmconnection" <<'NETWORK'
+[connection]
+id=vps2linux
+type=ethernet
+autoconnect=true
+
+[802-3-ethernet]
+mac-address=$TARGET_MAC
+
+[ipv4]
+method=manual
+address1=$TARGET_IPV4_CIDR,$TARGET_GATEWAY
+dns=$TARGET_DNS
+
+[ipv6]
+method=disabled
+NETWORK
+
+	# Prefer the saved bridge member MAC. If the target kernel exposes a
+	# different predictable name, NetworkManager can still match the device by
+	# MAC. If that fails, use the saved member/altnames, then the first UP NIC.
+	TARGET_INTERFACE_NAMES='$TARGET_INTERFACE_NAMES'
+	TARGET_MAC='$TARGET_MAC'
+	find_by_mac() {
+		local path name address
+		for path in /sys/class/net/*; do
+			[[ -r "\$path/address" ]] || continue
+			name=\${path##*/}
+			[[ "\$name" == lo ]] && continue
+			address=\$(tr '[:upper:]' '[:lower:]' < "\$path/address")
+			if [[ "\$address" == "\$TARGET_MAC" ]]; then
+				printf '%s\n' "\$name"
+				return 0
+			fi
+		done
+		return 1
+	}
+	find_by_name() {
+		local candidate old_ifs=\$IFS
+		IFS=,
+		for candidate in \$TARGET_INTERFACE_NAMES; do
+			if [[ -d "/sys/class/net/\$candidate" && "\$candidate" != lo ]]; then
+				printf '%s\n' "\$candidate"
+				IFS=\$old_ifs
+				return 0
+			fi
+		done
+		IFS=\$old_ifs
+		return 1
+	}
+	find_first_up() {
+		local path name state
+		for path in /sys/class/net/*; do
+			[[ -r "\$path/operstate" ]] || continue
+			name=\${path##*/}
+			[[ "\$name" == lo ]] && continue
+			state=\$(cat "\$path/operstate" 2>/dev/null || true)
+			if [[ "\$state" == up ]]; then
+				printf '%s\n' "\$name"
+				return 0
+			fi
+		done
+		return 1
+	}
+	SELECTED_INTERFACE=\$(find_by_mac || true)
+	NETWORK_MATCH=mac
+	if [[ -z "\$SELECTED_INTERFACE" ]]; then
+		SELECTED_INTERFACE=\$(find_by_name || true)
+		NETWORK_MATCH=name
+	fi
+	if [[ -z "\$SELECTED_INTERFACE" ]]; then
+		SELECTED_INTERFACE=\$(find_first_up || true)
+		NETWORK_MATCH=name
+	fi
+	{
+		printf '%s\n' '[connection]' 'id=vps2linux' 'type=ethernet' 'autoconnect=true'
+		if [[ "\$NETWORK_MATCH" == mac ]]; then
+			printf 'mac-address=%s\n' "\$TARGET_MAC"
+		elif [[ -n "\$SELECTED_INTERFACE" ]]; then
+			printf 'interface-name=%s\n' "\$SELECTED_INTERFACE"
+		fi
+		printf '%s\n' '' '[ipv4]'
+		printf 'method=manual\naddress1=%s,%s\ndns=%s\n' '$TARGET_IPV4_CIDR' '$TARGET_GATEWAY' '$TARGET_DNS'
+		printf '%s\n' '' '[ipv6]' 'method=disabled'
+	} > "\$ROOT/etc/NetworkManager/system-connections/vps2linux.nmconnection"
+	chmod 600 "\$ROOT/etc/NetworkManager/system-connections/vps2linux.nmconnection"
+
+mkdir -p "\$ROOT/root/.ssh"
+cat > "\$ROOT/root/.ssh/authorized_keys" <<'SSHKEYS'
+$AUTHORIZED_KEYS
+SSHKEYS
+chmod 700 "\$ROOT/root/.ssh"
+chmod 600 "\$ROOT/root/.ssh/authorized_keys"
+
+mkdir -p "\$ROOT/etc/ssh/sshd_config.d"
+cat > "\$ROOT/etc/ssh/sshd_config.d/90-vps2linux.conf" <<'SSHD'
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+SSHD
+
+systemctl --root="\$ROOT" enable sshd.service
+systemctl --root="\$ROOT" enable NetworkManager.service
+COMBUSTION
+chmod 0700 /run/config/combustion/script
+sync
+umount /run/config
+losetup -d "$CONFIG_LOOP"
+trap - EXIT
+
+# The image also has EFI/BOOT/BOOTX64.EFI, but an explicit NVRAM entry avoids
+# depending on firmware fallback behavior after replacing a previous OS.
+partx -u "$DISK" 2>/dev/null || true
+if [[ -d /sys/firmware/efi ]]; then
+	command -v efibootmgr >/dev/null 2>&1 || fail 'UEFI boot detected but efibootmgr is not staged'
+	efibootmgr -c -d "$DISK" -p 2 -L 'vps2linux' -l '\EFI\BOOT\BOOTX64.EFI' || \
+		fail 'efibootmgr could not create the vps2linux boot entry'
+	efibootmgr -v || fail 'efibootmgr could not read the new boot entry'
+else
+	printf '%s\n' 'UEFI runtime unavailable; relying on the EFI fallback path or BIOS boot code.'
+fi
+sync
+printf '%s\n' 'Raw image written. Rebooting into the new system.'
+reboot -f
+INNER
+	chmod 0755 "$BOOTSTRAP/run/deploy"
+}
+
+run_from_bootstrap() {
+	local oldroot="$BOOTSTRAP/oldroot"
+	local node type mountpoint
+	# EFI (/boot/efi) and any separate /boot partition must be detached before
+	# the target disk is overwritten.  The inner check remains as a second
+	# guard after pivot_root.
+	while read -r node type; do
+		[[ "$type" == part ]] || continue
+		while read -r mountpoint; do
+			[[ -n "$mountpoint" ]] || continue
+			umount -Rl "$mountpoint" 2>/dev/null || umount -l "$mountpoint" 2>/dev/null || \
+				die "cannot detach target mount: $node at $mountpoint"
+		done < <(findmnt -rn -S "$node" -o TARGET)
+	done < <(lsblk -nrpo NAME,TYPE "$TARGET_DISK")
+	mount --rbind /dev "$BOOTSTRAP/dev"
+	mount --make-rslave "$BOOTSTRAP/dev"
+	mount --rbind /proc "$BOOTSTRAP/proc"
+	mount --make-rslave "$BOOTSTRAP/proc"
+	mount --rbind /sys "$BOOTSTRAP/sys"
+	mount --make-rslave "$BOOTSTRAP/sys"
+	mkdir -p "$oldroot"
+	mount --make-rprivate /
+	mount --make-rprivate "$BOOTSTRAP"
+	pivot_root "$BOOTSTRAP" "$oldroot"
+	cd /
+	for mountpoint in /oldroot/dev /oldroot/proc /oldroot/sys; do
+		umount -Rl "$mountpoint" 2>/dev/null || true
+	done
+	export VPS2LINUX_ROOT_SOURCE="$ROOT_SOURCE"
+	exec /usr/bin/bash /run/deploy "$TARGET_DISK"
+}
+
+parse_args() {
+	EXECUTE=0
+	STAGE_TEST=0
+	while (($#)); do
+		case $1 in
+			--image-url) IMAGE_URL=${2:?missing value for --image-url}; shift 2 ;;
+			--image-file) IMAGE_FILE=${2:?missing value for --image-file}; shift 2 ;;
+			--sha256) IMAGE_SHA256=${2:?missing value for --sha256}; shift 2 ;;
+			--disk) TARGET_DISK=${2:?missing value for --disk}; shift 2 ;;
+			--hostname) TARGET_HOSTNAME=${2:?missing value for --hostname}; shift 2 ;;
+			--interface) TARGET_INTERFACE=${2:?missing value for --interface}; shift 2 ;;
+			--ipv4) TARGET_IPV4_CIDR=${2:?missing value for --ipv4}; shift 2 ;;
+			--gateway) TARGET_GATEWAY=${2:?missing value for --gateway}; shift 2 ;;
+			--dns) TARGET_DNS=${2:?missing value for --dns}; shift 2 ;;
+			--ssh-key-file) SSH_KEY_FILE=${2:?missing value for --ssh-key-file}; shift 2 ;;
+			--root-size-gib) ROOT_SIZE_GIB=${2:?missing value for --root-size-gib}; shift 2 ;;
+			--config-size-mib) CONFIG_SIZE_MIB=${2:?missing value for --config-size-mib}; shift 2 ;;
+			--execute) EXECUTE=1; shift ;;
+			--dry-run) EXECUTE=0; shift ;;
+			--stage-test) EXECUTE=0; STAGE_TEST=1; shift ;;
+			-h|--help) usage; exit 0 ;;
+			*) die "unknown option: $1" ;;
+		esac
+	done
+}
+
+main() {
+	parse_args "$@"
+	[[ $EUID -eq 0 ]] || die 'run as root'
+	check_dependencies
+	discover_source
+	discover_configuration
+	if [[ "$IMAGE_FILE" == *.raw || "$IMAGE_URL" == *.raw ]]; then
+		:
+	else
+		need_command unsquashfs
+	fi
+	prepare_image
+	print_plan
+
+	if (( STAGE_TEST )); then
+		stage_bootstrap
+		/usr/bin/bash -n "$BOOTSTRAP/run/deploy"
+		umount -Rl "$BOOTSTRAP"
+		printf '%s\n' 'STAGE-TEST: RAM bootstrap and inner deployer syntax are valid; no disk was changed.'
+		return 0
+	fi
+
+	if (( ! EXECUTE )); then
+		printf '%s\n' 'DRY-RUN: no disk, mount, service, or reboot operation was performed.'
+		return 0
+	fi
+	[[ "${VPS2LINUX_CONFIRM:-}" == "WIPE:$TARGET_DISK" ]] || \
+		die "set VPS2LINUX_CONFIRM=WIPE:$TARGET_DISK to allow the destructive operation"
+	[[ "$SOURCE_DISK" == "$TARGET_DISK" ]] || warn 'target is not the current root disk; verify it before continuing'
+	stage_bootstrap
+	run_from_bootstrap
+}
+
+main "$@"
