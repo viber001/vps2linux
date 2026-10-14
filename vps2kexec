@@ -1077,17 +1077,21 @@ AuthorizedKeysFile .ssh/authorized_keys /etc/ssh/authorized_keys.d/%u
 PasswordAuthentication $SSHD_PASSWORD_AUTH
 SSHD
 
-# Let the created user run sudo with their own password. openSUSE ships
-# `Defaults targetpw`, so sudo would ask for ROOT's password instead of the
-# caller's; override it for $TARGET_USER so the usual behavior applies.
-if [[ '$TARGET_USER' != root ]] && [[ -e "\$ROOT/usr/etc/sudoers" || -e "\$ROOT/etc/sudoers" ]]; then
-	mkdir -p "\$ROOT/etc/sudoers.d"
-	cat > "\$ROOT/etc/sudoers.d/90-vps2kexec" <<SUDOERS
-Defaults:$TARGET_USER !targetpw
-$TARGET_USER ALL=(ALL) ALL
+# Add the created user to wheel and let the group run sudo with the caller's
+# own password. openSUSE ships `Defaults targetpw`, so a plain `%wheel` rule
+# would still ask for ROOT's password; override it for the group.
+if [[ '$TARGET_USER' != root ]]; then
+	run_in_target usermod -aG wheel '$TARGET_USER' 2>/dev/null || \
+		run_in_target gpasswd -a '$TARGET_USER' wheel 2>/dev/null || true
+	if [[ -e "\$ROOT/usr/etc/sudoers" || -e "\$ROOT/etc/sudoers" ]]; then
+		mkdir -p "\$ROOT/etc/sudoers.d"
+		cat > "\$ROOT/etc/sudoers.d/wheel" <<'SUDOERS'
+Defaults:%wheel !targetpw
+%wheel ALL=(ALL:ALL) ALL
 SUDOERS
-	chmod 0440 "\$ROOT/etc/sudoers.d/90-vps2kexec"
-	chown root:root "\$ROOT/etc/sudoers.d/90-vps2kexec"
+		chmod 0440 "\$ROOT/etc/sudoers.d/wheel"
+		chown root:root "\$ROOT/etc/sudoers.d/wheel"
+	fi
 fi
 
 systemctl --root="\$ROOT" enable sshd.service
