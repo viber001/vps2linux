@@ -102,6 +102,6 @@ vps2img-pivot:
 
 - `tools/build.py`：预处理器（仅标准库）。
 - `src/assets/`：仅被指令引用的正文，不参与合并。
-  - `combustion-base.txt`：两个程序共享的 105 行 Combustion 正文（含 `@PROGRAM@`）。
-  - `combustion-pivot.txt`：`(#@INCLUDE@) …combustion-base.txt` + pivot 专属尾部。
-  - `combustion-kexec.txt`：同上 + kexec 专属尾部。
+  - `combustion-base.sh`：两个程序共享的 105 行 Combustion 正文（含 `@PROGRAM@`）。
+  - `combustion-pivot.sh`：`(#@INCLUDE@) …combustion-base.sh` + pivot 专属尾部。
+  - `combustion-kexec.sh`：同上 + kexec 专属尾部。

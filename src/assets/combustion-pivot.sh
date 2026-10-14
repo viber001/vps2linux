@@ -1,4 +1,4 @@
-(#@INCLUDE@) src/assets/combustion-base.txt
+(#@INCLUDE@) src/assets/combustion-base.sh
 mkdir -p "\$ROOT/etc/ssh/sshd_config.d"
 cat > "\$ROOT/etc/ssh/sshd_config.d/90-vps2img-pivot.conf" <<'SSHD'
 PermitRootLogin prohibit-password

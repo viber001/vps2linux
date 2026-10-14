@@ -12,7 +12,7 @@
 # Combustion script -- out of src/assets/ and substitute @KEY@ placeholders.
 SHELL := /bin/sh
 
-sources = $(wildcard src/*/*.sh src/assets/*.txt tools/build.py)
+sources = $(wildcard src/vps2img-pivot/*.sh src/vps2img-kexec/*.sh src/lib/*.sh src/assets/*.sh tools/build.py)
 
 all: vps2img-pivot vps2img-kexec
 

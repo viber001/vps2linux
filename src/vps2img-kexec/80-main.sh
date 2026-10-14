@@ -82,7 +82,7 @@ if [[ -n "$TARGET_PASSWORD" ]]; then
 	[[ "$TARGET_USER" != root ]] || SSHD_ROOT_LOGIN=yes
 fi
 
-(#@HEREDOC@expand) cat > /config/combustion/script <<COMBUSTION | src/assets/combustion-kexec.txt
+(#@HEREDOC@expand) cat > /config/combustion/script <<COMBUSTION | src/assets/combustion-kexec.sh
 chmod 0700 /config/combustion/script
 sync
 umount /config

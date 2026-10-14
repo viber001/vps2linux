@@ -68,7 +68,7 @@ mkfs.ext4 -F -L combustion "$CONFIG_LOOP"
 mkdir -p /run/config
 mount "$CONFIG_LOOP" /run/config
 mkdir -p /run/config/combustion
-(#@HEREDOC@expand) cat > /run/config/combustion/script <<COMBUSTION | src/assets/combustion-pivot.txt
+(#@HEREDOC@expand) cat > /run/config/combustion/script <<COMBUSTION | src/assets/combustion-pivot.sh
 chmod 0700 /run/config/combustion/script
 sync
 umount /run/config

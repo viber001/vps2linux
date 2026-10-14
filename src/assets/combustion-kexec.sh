@@ -1,4 +1,4 @@
-(#@INCLUDE@) src/assets/combustion-base.txt
+(#@INCLUDE@) src/assets/combustion-base.sh
 # Provision the requested login user, its password and its SSH key. Leap
 # Micro's Combustion chroots into the target root before running this script
 # (so ROOT is usually /); when a /sysroot layout is used instead, run the
