@@ -63,6 +63,7 @@ RAW_FILE=
 RAW_SIZE=
 DROPBEAR_KEY=
 TARGET_NIC_DRIVER=
+TARGET_DISK_DRIVER=
 ROOT_SOURCE=
 SOURCE_DISK=
 STAGE=$WORKDIR/initramfs-root
@@ -273,6 +274,35 @@ discover_source() {
 	[[ "$(lsblk -dnro TYPE "$TARGET_DISK")" == disk ]] || die "$TARGET_DISK is not a whole disk"
 }
 
+# device_driver_module prints the module name backing a sysfs device node (the
+# first parent with a driver symlink). It is used to capture the storage and
+# network drivers that the running hardware needs so the kexec initramfs can
+# load them again on a physical machine, where those drivers are modules.
+device_driver_module() {
+	local node driver
+	node=$(readlink -f "$1" 2>/dev/null) || return 1
+	while [[ -n "$node" && "$node" != / ]]; do
+		if [[ -L "$node/driver" ]]; then
+			driver=$(basename "$(readlink -f "$node/driver")")
+			if [[ -n "$driver" ]]; then
+				printf '%s\n' "$driver"
+				return 0
+			fi
+		fi
+		node=$(dirname "$node")
+	done
+	return 1
+}
+
+# block_driver_module resolves the driver for a whole block device. The disk
+# itself is handled by sd_mod/nvme/virtio_blk; walking up the device chain adds
+# the host controller (ahci, virtio_scsi, mpt3sas, ...), which is what a
+# module-based physical kernel needs.
+block_driver_module() {
+	local disk=${1##*/}
+	device_driver_module "/sys/class/block/$disk/device" 2>/dev/null || true
+}
+
 discover_configuration() {
 	local nameserver bridge_member altname
 	[[ -n "$TARGET_HOSTNAME" ]] || TARGET_HOSTNAME=$(hostname -s)
@@ -316,11 +346,15 @@ discover_configuration() {
 	TARGET_DNS=${TARGET_DNS// /;}
 	[[ "$TARGET_DNS" == '' || "$TARGET_DNS" == *';' ]] || TARGET_DNS+=';'
 
-	# Capture the source NIC driver so /init can modprobe it as a no-op safety
-	# net (the PVE source kernel builds virtio_net in, so no module is needed,
-	# but a module-based VPS kernel may need it).
+	# Capture the source NIC and storage drivers so /init can modprobe them on
+	# a physical machine whose kernel ships them as modules. On the PVE source
+	# kernel virtio_net is built in, so the NIC name is normally empty.
 	if [[ -z "$TARGET_NIC_DRIVER" ]]; then
-		TARGET_NIC_DRIVER=$(basename "$(readlink -f "/sys/class/net/$TARGET_INTERFACE/device/driver" 2>/dev/null)" 2>/dev/null || true)
+		TARGET_NIC_DRIVER=$(device_driver_module "/sys/class/net/$TARGET_INTERFACE/device" 2>/dev/null || true)
+		[[ -n "$TARGET_NIC_DRIVER" ]] || TARGET_NIC_DRIVER=$(device_driver_module "/sys/class/net/$TARGET_INTERFACE" 2>/dev/null || true)
+	fi
+	if [[ -z "$TARGET_DISK_DRIVER" ]]; then
+		TARGET_DISK_DRIVER=$(block_driver_module "$TARGET_DISK")
 	fi
 
 	[[ "$TARGET_HOSTNAME" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$ ]] || \
@@ -403,7 +437,7 @@ check_dependencies() {
 	for command_name in awk blockdev cp cpio findmnt gzip lsblk mount readlink rm sha256sum sfdisk sgdisk stat sync tr umount; do
 		need_command "$command_name"
 	done
-	for command_name in busybox dropbearkey hostname ip mountpoint paste; do
+	for command_name in busybox dropbearkey hostname ip modinfo modprobe mountpoint paste; do
 		need_command "$command_name"
 	done
 	# unsquashfs is only needed in embed mode when the source is an archive.
@@ -438,6 +472,63 @@ stage_binary_into() {
 			cp -a "$dependency_real" "$root$dependency_real"
 		fi
 	done < <(ldd "$real" 2>/dev/null | awk '/=> \/[^ ]+/ { print $3 } /^[[:space:]]*\/[^ ]+/ { print $1 }')
+}
+
+# module_names_to_stage lists every module the running (physical) machine has
+# in use, plus the drivers and filesystems the deploy initramfs always needs.
+# The running system is the target machine, so its in-use modules are exactly
+# the drivers the kexec initramfs must load again.
+module_names_to_stage() {
+	{
+		lsmod | awk 'NR > 1 { print $1 }'
+		printf '%s\n' "${TARGET_NIC_DRIVER:-}" "${TARGET_DISK_DRIVER:-}" \
+			loop ext4 vfat btrfs sd_mod scsi_mod
+	} | awk 'NF' | sort -u
+}
+
+# stage_kernel_modules copies the .ko files for the in-use modules (with their
+# full dependency closure) and the modprobe metadata into the initramfs, so the
+# same kernel can bring the target hardware up after kexec on a physical host.
+stage_kernel_modules() {
+	local kver mod ko file modules_dir
+	kver=$(uname -r)
+	modules_dir=/lib/modules/$kver
+	[[ -d "$modules_dir" ]] || { warn "no $modules_dir; not staging kernel modules"; return 0; }
+	mkdir -p "$STAGE$modules_dir"
+	declare -A seen=()
+	while read -r mod; do
+		[[ -n "$mod" ]] || continue
+		while read -r ko; do
+			[[ -n "$ko" && -f "$ko" ]] || continue
+			[[ -n "${seen[$ko]:-}" ]] && continue
+			seen[$ko]=1
+			mkdir -p "$STAGE$(dirname "$ko")"
+			cp -a "$ko" "$STAGE$ko"
+		done < <(modprobe --show-depends "$mod" 2>/dev/null | awk '/^insmod / { print $2 }')
+	done < <(module_names_to_stage)
+	for file in modules.dep modules.dep.bin modules.alias modules.alias.bin \
+		modules.softdep modules.builtin modules.builtin.bin modules.symbols modules.symbols.bin; do
+		[[ -f "$modules_dir/$file" ]] || continue
+		cp -a "$modules_dir/$file" "$STAGE$modules_dir/$file"
+	done
+}
+
+# stage_firmware copies any firmware blobs the in-use modules request; some
+# physical NICs and storage controllers need them before they initialise.
+stage_firmware() {
+	local mod fw candidate
+	while read -r mod; do
+		[[ -n "$mod" ]] || continue
+		while read -r fw; do
+			[[ -n "$fw" ]] || continue
+			for candidate in "/lib/firmware/updates/$fw" "/lib/firmware/$fw" \
+				"/lib/firmware/updates/$(uname -r)/$fw" "/lib/firmware/$(uname -r)/$fw"; do
+				[[ -f "$candidate" ]] || continue
+				mkdir -p "$STAGE$(dirname "$candidate")"
+				cp -a "$candidate" "$STAGE$candidate"
+			done
+		done < <(modinfo -F firmware "$mod" 2>/dev/null)
+	done < <(module_names_to_stage)
 }
 
 write_init() {
@@ -605,13 +696,23 @@ trap 'printf "[vps2kexec] init exiting rc=%s\n" "$?" > /dev/kmsg 2>/dev/null; re
 log "kexec initramfs is up, kernel $(uname -r)"
 log "target disk ${DISK:-unknown}, image mode ${IMAGE_MODE:-stream}"
 
-# Safety no-op: load the source NIC driver if it is a module. On the PVE
-# source kernel virtio_net is built in, so this normally does nothing; it
-# matters only on a VPS kernel that ships the driver as a module.
-if [ -n "${TARGET_NIC_DRIVER:-}" ]; then
-	modprobe "$TARGET_NIC_DRIVER" 2>/dev/null && \
-		log "loaded NIC module $TARGET_NIC_DRIVER" || true
-fi
+# Load the drivers the running hardware used, so kexec brings up the network and
+# storage on a physical machine whose kernel ships them as modules. On a kernel
+# that builds them in, these calls are harmless no-ops.
+load_required_modules() {
+	local mod
+	# Coldplug through busybox mdev (in place of the udev a bare initramfs does
+	# not have): the modalias rule lets the kernel autoload present devices.
+	if command -v mdev >/dev/null 2>&1; then
+		printf '%s\n' '$MODALIAS=.* 0:0 0660 @modprobe $MODALIAS' > /etc/mdev.conf
+		mdev -s 2>/dev/null || true
+	fi
+	for mod in loop ext4 vfat sd_mod scsi_mod "${TARGET_DISK_DRIVER:-}" "${TARGET_NIC_DRIVER:-}"; do
+		[ -n "$mod" ] || continue
+		modprobe "$mod" 2>/dev/null && log "loaded module $mod" || true
+	done
+}
+load_required_modules
 
 bring_up_network || log 'WARNING: network bring-up failed; streaming may fail'
 start_dropbear
@@ -628,7 +729,7 @@ start_dropbear
 
 if write_image; then
 	log 'running deployer'
-	if /usr/bin/bash /deploy "$DISK"; then
+	if /usr/bin/bash /deploy "$DISK" >/dev/kmsg 2>&1; then
 		log 'deployer returned 0 without rebooting; entering rescue'
 	else
 		log "deployer failed with status $?; entering rescue"
@@ -743,6 +844,15 @@ sgdisk --verify "$DISK" || fail "the target GPT failed verification: $DISK"
 ACTUAL_ROOT=$(sfdisk --dump "$DISK" | awk -v part="${DISK}3" '$1 == part { gsub(/,/, "", $4); gsub(/,/, "", $6); print $4 " " $6; exit }')
 [[ "$ACTUAL_ROOT" == "$RAW_ROOT_START $ROOT_SIZE_SECTORS" ]] || \
 	fail "target GPT root partition mismatch: expected $RAW_ROOT_START/$ROOT_SIZE_SECTORS, got ${ACTUAL_ROOT:-missing}"
+# Assert the Combustion partition exists and no >10 MiB hole is left: openSUSE
+# Leap Micro's first boot (55kiwi-repart) relocates kiwi_RootPart and drops
+# this partition whenever more than ~10 MiB of unpartitioned space is free.
+ACTUAL_CONFIG=$(sfdisk --dump "$DISK" | awk -v part="${DISK}4" '$1 == part { print $1 }')
+[[ -n "$ACTUAL_CONFIG" ]] || fail 'the Combustion partition was not created'
+LAST_USABLE=$((DISK_SECTORS - 34))
+FREE_SECTORS=$((LAST_USABLE - CONFIG_END))
+(( FREE_SECTORS * SECTOR_SIZE < 10 * 1024 * 1024 )) || \
+	fail "target disk still has ${FREE_SECTORS} free sectors; Leap Micro would repartition it"
 
 CONFIG_OFFSET=$((CONFIG_START * SECTOR_SIZE))
 CONFIG_BYTES=$((CONFIG_SIZE * SECTOR_SIZE))
@@ -957,6 +1067,14 @@ SSHD
 systemctl --root="\$ROOT" enable sshd.service
 systemctl --root="\$ROOT" enable NetworkManager.service
 
+# Grow the root filesystem to fill its partition. The deployer normally does
+# this before the first boot; this is a fallback for a source host without
+# btrfs-progs. It is idempotent (a no-op once the filesystem fills the
+# partition).
+if command -v btrfs >/dev/null 2>&1; then
+	btrfs filesystem resize max "\$ROOT" 2>/dev/null || true
+fi
+
 # Mirror kernel and systemd output to the VGA console in addition to the serial
 # console, so the boot is visible on the PVE web console even when the serial
 # console is not attached. The image already carries console=tty0 in
@@ -983,6 +1101,35 @@ trap - EXIT
 # efibootmgr resolves partition 2, and create an explicit NVRAM entry.
 partx -u "$DISK" 2>/dev/null || true
 blockdev --rereadpt "$DISK" 2>/dev/null || true
+
+# Grow the image's root filesystem to fill the (larger) root partition before
+# the first boot. Filling the disk with the Combustion partition suppresses the
+# image's own growroot / kiwi-repart first-boot resize, so grow it here or the
+# root stays at its small image size (a few GiB) inside a large partition.
+# btrfs resize needs a mounted path, so mount the partition briefly; the
+# Combustion script also grows it as a fallback if this cannot run.
+ROOT_PART=$DISK
+case "$DISK" in
+	/dev/nvme*|/dev/mmcblk*|/dev/loop*) ROOT_PART="${DISK}p3" ;;
+	*) ROOT_PART="${DISK}3" ;;
+esac
+if [[ -b "$ROOT_PART" ]] && command -v btrfs >/dev/null 2>&1; then
+	modprobe btrfs 2>/dev/null || true
+	mkdir -p /mnt/root
+	if mount -o rw "$ROOT_PART" /mnt/root 2>/dev/null; then
+		if btrfs filesystem resize max /mnt/root; then
+			printf 'Grew the root filesystem on %s to fill the partition\n' "$ROOT_PART"
+		else
+			printf 'WARNING: could not grow the root filesystem on %s\n' "$ROOT_PART" >&2
+		fi
+		umount /mnt/root 2>/dev/null || true
+	else
+		printf 'WARNING: could not mount %s to grow the root filesystem\n' "$ROOT_PART" >&2
+	fi
+else
+	printf 'WARNING: btrfs is unavailable; the root filesystem was not grown here\n' >&2
+fi
+
 if [[ -d /sys/firmware/efi ]]; then
 	command -v efibootmgr >/dev/null 2>&1 || fail 'UEFI boot detected but efibootmgr is not staged'
 	efibootmgr -c -d "$DISK" -p 2 -L 'vps2kexec' -l '\EFI\BOOT\BOOTX64.EFI' || \
@@ -1013,6 +1160,19 @@ build_initramfs() {
 		[[ -n "$command_file" ]] || die "cannot stage command into the initramfs: $command_name"
 		stage_binary_into "$STAGE" "$command_file"
 	done
+	# btrfs-progs grows the image's root filesystem to fill its partition; it is
+	# optional so the deploy still works on a source without btrfs-progs (the
+	# Combustion script grows the filesystem as a fallback).
+	if command_file=$(command_path btrfs); then
+		stage_binary_into "$STAGE" "$command_file"
+	else
+		warn 'btrfs is not installed on the source; the root filesystem will be grown by the target instead'
+	fi
+
+	# Stage the kernel modules and firmware the running hardware needs, so the
+	# kexec initramfs can bring the same hardware up on a physical machine.
+	stage_kernel_modules
+	stage_firmware
 
 	# Minimal account/database files so dropbear can resolve root and exec a shell.
 	printf 'root:x:0:0:root:/root:/bin/sh\n' > "$STAGE/etc/passwd"
@@ -1061,6 +1221,7 @@ build_initramfs() {
 		printf 'TARGET_USER=%q\n' "$TARGET_USER"
 		printf 'TARGET_PASSWORD=%q\n' "$TARGET_PASSWORD"
 		printf 'TARGET_NIC_DRIVER=%q\n' "$TARGET_NIC_DRIVER"
+		printf 'TARGET_DISK_DRIVER=%q\n' "$TARGET_DISK_DRIVER"
 		printf 'ROOT_SIZE_GIB=%q\n' "$ROOT_SIZE_GIB"
 		printf 'CONFIG_SIZE_MIB=%q\n' "$CONFIG_SIZE_MIB"
 	} > "$STAGE/deploy.env"
