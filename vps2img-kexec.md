@@ -109,10 +109,12 @@ ISO 内的证据（`http://10.68.247.14:16000/eiso/id/3/`）：
 - VM 600 在 **Secure Boot 开启**（`mokutil --sb-state` = `SecureBoot enabled`，lockdown integrity）下：`--stage-test` 用 `kexec_file_load`（`-s`）加载 23.7 MiB initramfs 成功，完整 `--execute` 部署进入 Leap Micro 6.2，目标端 Secure Boot 仍为 enabled。
 - 物理机 c49（Inspur NS5488M5 节点，Debian 13 + PVE 源）：驱动按整条设备链收集，`eno2` 物理网卡上电，部署成功进入 Leap Micro。
 - 在 openSUSE Leap Micro 6.2 源（无可用的 `apt`、无 `ar`/binutils）上验证：`debian`（该源上 `auto` 也解析为它）经 HTTP 组装 ramdisk 后 `--execute` 部署成功，目标 `pve2-leap-test` 启动、静态网络/用户/密码/wheel sudo/SSH key 生效，Btrfs 无损坏；`--ramdisk-source apt` 在该源上按预期拒绝（无 `apt-get`）。`apt` 模式在 PVE Debian 源上（缺 `kexec-tools`）经 `apt-get` 补齐后按 host 模式构建成功。
+- Harvester 节点（Harvester v1.8.2 / SLES 16，root 是 loop 设备 `/dev/loop0`，backing file `/cOS/active.img` 落在 `COS_STATE` 分区）：`discover_source` 新增 loop-root 回退后，p123 / p126 的 `--dry-run` 均输出完整计划（`source root: /dev/loop0 (ext2)`、`source disk: /dev/sda`），stream 与 embed 两种镜像模式皆可用。PVE ext4+LVM、PVE/Leap Micro Btrfs 等非 loop 根不受影响。
 
 ## 已知限制
 
 - 需要关闭 Secure Boot 仅当你用 `--kernel` 指定了一个非当前运行的、未签名/未受信任的内核；默认加载当前运行内核时 Secure Boot 可保持开启（见上）。
 - 源系统默认（`--ramdisk-source auto`）在宿主工具齐全时直接 staging 宿主（`host`），缺工具则改为经 HTTP 获取 d-i 组件（`debian`）；`--ramdisk-source host` 强制宿主并缺则报错，`debian` 强制下载（无需宿主包管理器，适用于 Leap Micro 等非 apt 源），`apt` 先用 `apt-get` 补齐缺失工具再 staging 宿主。读 `.deb/.udeb` 需要 `ar`，缺失时回退到宿主 busybox 的 `ar` applet，仍缺失则下载 busybox.net 的静态 busybox。
 - 驱动收集只在 virtio 与 Inspur 的网卡/磁盘路径上验证过，其他 AHCI/NVMe/RAID 控制器尚待在物理机验证。
+- 源根为 loop 设备（不可变 OS 镜像，如 Harvester/cOS）时，脚本用 `/sys/block/<loop>/loop/backing_file` 配合当前挂载点反查该文件所在的整盘；要求 backing file 所在分区仍处于挂载状态（Harvester 的 `COS_STATE` 挂在 `/run/initramfs/cos-state`）。
 - 这是破坏性实验工具，默认只探测与 dry-run；目标盘必须有独立控制台、救援介质或可回滚快照。
