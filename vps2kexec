@@ -64,6 +64,8 @@ RAW_SIZE=
 DROPBEAR_KEY=
 TARGET_NIC_DRIVERS=
 TARGET_DISK_DRIVERS=
+KEXEC_METHOD=
+KEXEC_LOCKDOWN=0
 ROOT_SOURCE=
 SOURCE_DISK=
 STAGE=$WORKDIR/initramfs-root
@@ -122,7 +124,8 @@ Options:
   --execute             Load the initramfs with kexec and switch kernels
   --dry-run             Print the plan without staging or changing anything
   --stage-test          Build the initramfs, syntax-check its scripts and
-                        kexec -l / kexec -u without switching kernels
+                        kexec -l / kexec -u without switching kernels; this
+                        works under Secure Boot via kexec_file_load (-s)
   -h, --help            Show this help
 
 Examples:
@@ -406,7 +409,12 @@ check_kexec_support() {
 	lockdown=$(cat /sys/kernel/security/lockdown 2>/dev/null || true)
 	case "$lockdown" in
 		*'[integrity]'*|*'[confidentiality]'*)
-			die "kernel lockdown is active ($lockdown); disable Secure Boot so kexec is permitted"
+			# Lockdown only denies the legacy kexec_load syscall. The
+			# file-based kexec_file_load syscall is still allowed for a
+			# kernel image the firmware trusts (the running, signed kernel),
+			# so Secure Boot no longer has to be disabled.
+			warn "kernel lockdown is active ($lockdown); using kexec_file_load (-s) with the running signed kernel"
+			KEXEC_LOCKDOWN=1
 			;;
 	esac
 }
@@ -1267,13 +1275,42 @@ build_initramfs() {
 	rm -rf "$STAGE"
 }
 
+# load_kexec_image loads the running kernel plus the generated initramfs into the
+# kexec slot. Under UEFI Secure Boot the kernel is locked down and only
+# kexec_file_load (-s) is permitted, and only for a kernel image the firmware
+# already trusts -- the running, signed kernel that booted under Secure Boot.
+# kexec_load (-c) is kept as a fallback for a host without lockdown, where the
+# legacy syscall is still allowed.
+load_kexec_image() {
+	local command_line=$1
+	printf 'Loading kernel with kexec_file_load (-s): %s\n' "$KEXEC_KERNEL"
+	if kexec -s -l "$KEXEC_KERNEL" --initrd="$INITRAMFS" --command-line="$command_line"; then
+		KEXEC_METHOD=file
+		return 0
+	fi
+	if (( KEXEC_LOCKDOWN )); then
+		die 'kexec_file_load (-s) was rejected while lockdown is active; the running kernel was not accepted as a trusted image'
+	fi
+	printf '%s\n' 'kexec_file_load (-s) failed; falling back to kexec_load (-c)'
+	kexec -c -l "$KEXEC_KERNEL" --initrd="$INITRAMFS" --command-line="$command_line" || \
+		die 'kexec could not load the kernel with either kexec_file_load (-s) or kexec_load (-c)'
+	KEXEC_METHOD=legacy
+}
+
+# unload_kexec_image clears whatever load_kexec_image put in the kexec slot,
+# preferring the syscall that actually loaded it.
+unload_kexec_image() {
+	if [[ "$KEXEC_METHOD" == legacy ]]; then
+		kexec -c -u 2>/dev/null || kexec -u
+	else
+		kexec -s -u 2>/dev/null || kexec -u
+	fi
+}
+
 run_kexec() {
 	local command_line
 	command_line="console=ttyS0,115200 console=tty0 panic=120 vps2kexec.disk=$TARGET_DISK"
-	printf 'Loading kernel with kexec: %s\n' "$KEXEC_KERNEL"
-	# Use the kexec_load syscall (-c): the file-based kexec_file_load syscall
-	# refuses a multi-hundred-MiB initramfs with EADDRNOTAVAIL on this kernel.
-	kexec -c -l "$KEXEC_KERNEL" --initrd="$INITRAMFS" --command-line="$command_line"
+	load_kexec_image "$command_line"
 	printf '%s\n' 'Switching kernels with kexec -e; the old kernel and systemd are discarded now.'
 	sync
 	kexec -e
@@ -1326,10 +1363,9 @@ main() {
 	if (( STAGE_TEST )); then
 		build_initramfs
 		printf 'STAGE-TEST: initramfs is %s bytes\n' "$(stat -c '%s' "$INITRAMFS")"
-		kexec -c -l "$KEXEC_KERNEL" --initrd="$INITRAMFS" \
-			--command-line="console=ttyS0,115200 console=tty0 panic=120 vps2kexec.disk=$TARGET_DISK"
-		kexec -c -u
-		printf '%s\n' 'STAGE-TEST: initramfs scripts syntax-checked and kexec load/unload succeeded; no kernel switch and no disk change.'
+		load_kexec_image "console=ttyS0,115200 console=tty0 panic=120 vps2kexec.disk=$TARGET_DISK"
+		unload_kexec_image
+		printf '%s\n' "STAGE-TEST: initramfs scripts syntax-checked and kexec load/unload succeeded (method=$KEXEC_METHOD); no kernel switch and no disk change."
 		[[ "${VPS2KEXEC_KEEP_INITRAMFS:-0}" == 1 ]] || rm -f "$INITRAMFS"
 		return 0
 	fi
