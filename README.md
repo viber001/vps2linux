@@ -66,10 +66,10 @@ VPS2LINUX_CONFIRM=WIPE:/dev/sda \
 
 要求：
 
-- 源主机已安装 `kexec-tools`、`dropbear`、`busybox-static`、`cpio`、`gzip`、`squashfs-tools`、`gdisk`/`sgdisk`。
-- Secure Boot 必须关闭：`/sys/kernel/security/lockdown` 中不能含 `[integrity]` 或 `[confidentiality]`，否则脚本直接退出。
-- initramfs 使用内核内置驱动即可（ext4、virtio、squashfs、efivarfs 等），无需额外内核模块；脚本仍会记录源网卡驱动名并在 `/init` 里 `modprobe` 一次作为无副作用保险。
-- `kexec -c -l` 使用 compat 系统调用（`kexec_load`），因为大 initramfs 在 `kexec_file_load` 下会以 `Cannot assign requested address` 失败。
+- 源主机已安装 `kexec-tools`、`dropbear`、`busybox-static`、`cpio`、`gzip`、`gdisk`/`sgdisk`（`--image-mode stream` 直接流式写 raw image，不需要 `squashfs-tools`）。
+- 内核需支持 kexec（`kexec_load` 自 Linux 2.6.13，`kexec_file_load` 自 3.17）：物理机、KVM/Xen/HN 可用，容器（OpenVZ/LXC）不可用。
+- 默认用 `kexec_file_load`（`kexec -s -l`）加载**当前正在运行的内核**，因此 **Secure Boot 可以保持开启**（lockdown 只禁止旧的 `kexec_load`）。仅当 `-s` 失败且系统未处于 lockdown 时才回退到 `kexec -c -l`；`--kernel` 指定未签名内核时仍需关闭 Secure Boot。
+- initramfs 按整条设备链收集在用驱动模块（`lsmod` + 目标磁盘/网卡驱动闭包）和固件，以便在物理机上启动；内核内置的驱动自动跳过。
 
 默认 `--image-mode stream`：initramfs 保持极小（busybox + 少量工具，几 MB），raw image 通过 HTTP 直接流式写入目标盘（`wget -O - <url> | dd of=<disk> bs=4M`），任何时候都不把整块 image 放进 RAM；随后从目标盘回读前 `--image-size` 字节做 SHA-256 校验（未给出 `--image-size` 时用 HTTP `Content-Length` 推导）。`--image-mode embed` 把整块 image 内嵌进 initramfs，仅作为显式的非默认选项保留，非常耗内存。
 
@@ -93,7 +93,26 @@ VPS2LEAPMICRO_CONFIRM=WIPE:/dev/sda \
   --root-size-gib 40
 ```
 
-执行路径已在 VM 600 上端到端验证：`kexec -e` 后 initramfs 流式写入 image、重建 GPT 并创建直达磁盘末尾的 Combustion 分区（不留未分配空间，使 KIWI 首启跳过重分区），重启后由 `efibootmgr` 的 `vps2leapmicro` 启动项引导 Leap Micro；Combustion 首启生效（hostname、用户名/密码、静态 IP、`authorized_keys`），且首启后 Combustion 分区仍然存在、Btrfs 无损坏。
+执行路径已在 VM 600 上端到端验证：`kexec -e` 后 initramfs 流式写入 image、重建 GPT 并创建直达磁盘末尾的 Combustion 分区（不留未分配空间，使 KIWI 首启跳过重分区），重启后由 `efibootmgr` 的 `vps2leapmicro` 启动项引导 Leap Micro；Combustion 首启生效（hostname、用户名/密码、静态 IP、`authorized_keys`），且首启后 Combustion 分区仍然存在、Btrfs 无损坏。VM 600/602 已在 Secure Boot 开启与关闭两种状态下验证通过。详见 `vps2leapmicro.md`。
+
+`vps2linux` 的 `pivot_root`（不使用 kexec）原理与研发测试过程见 `vps2linux.md`。
+
+## vps2ins（实验性）
+
+`vps2ins` 是 `vps2leapmicro` 的一个**实验性**变体，部署逻辑完全相同（kexec、流式写盘、GPT 重建、Combustion、扩容、EFI 启动项），唯一区别是 **initramfs 用户态来源**：它默认从 Debian 安装器（d-i）组件经普通 HTTP 获取并自行组装 ramdisk，不依赖宿主的包管理器，因此也能在**非 apt 源**（RHEL/openSUSE）上构建。
+
+```bash
+VPS2INS_CONFIRM=WIPE:/dev/sda \
+  ./vps2ins --execute \
+  --image-url 'http://10.68.247.224:18080/openSUSE-Leap-Micro.raw' \
+  --sha256 "$RAW_IMAGE_SHA256" \
+  --disk /dev/sda --hostname pve2-leap-test --interface vmbr0 \
+  --gateway 10.68.247.199 --ipv4 10.68.247.165/24 --dns 172.18.202.2 \
+  --user leap --password '<password>' \
+  --ssh-key-file /root/.ssh/authorized_keys --root-size-gib 100
+```
+
+可用 `--ramdisk-source host` 切回 `vps2leapmicro` 的“打包宿主二进制”行为，`--di-mirror/--di-suite/--di-arch` 选择 d-i 源。该路径尚未定型，默认请用 `vps2leapmicro`。
 
 ## 安全边界
 

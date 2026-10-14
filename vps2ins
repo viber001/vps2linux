@@ -5,6 +5,15 @@ set -Eeuo pipefail
 # booting a self-made initramfs with kexec.
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
+# EXPERIMENTAL / 实验性: this is a variant of vps2leapmicro whose only
+# difference is where the initramfs userspace comes from. Instead of staging
+# the running host's busybox/binaries (that path needs the host package
+# manager), vps2ins fetches Debian installer (d-i) components over plain HTTP
+# and assembles the ramdisk itself, so it can also build on a non-apt source
+# (RHEL/openSUSE). Everything else (kexec load, streamed image write, GPT
+# rebuild, Combustion, root grow, EFI entry) is the same as vps2leapmicro.
+# Treat this route as unproven and keep vps2leapmicro as the default.
+#
 # Plan 2 of vps2linux.  The pivot_root bootstrap of vps2linux cannot actually
 # stop the old kernel from writing the target disk: old systemd, old btrfs
 # async discard and old writeback keep touching the device after dd.  This

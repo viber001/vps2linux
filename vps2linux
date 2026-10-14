@@ -150,10 +150,14 @@ discover_source() {
 }
 
 discover_configuration() {
-	local nameserver bridge_member altname
+	local nameserver bridge_member altname source_interface
 	[[ -n "$TARGET_HOSTNAME" ]] || TARGET_HOSTNAME=$(hostname -s)
 	[[ -n "$TARGET_INTERFACE" ]] || TARGET_INTERFACE=$(ip -4 route show default | awk 'NR == 1 { print $5; exit }')
 	[[ -n "$TARGET_INTERFACE" ]] || die 'cannot determine the default network interface; set --interface'
+	# The source address and default route live on the interface that carries
+	# them (a bridge such as vmbrX), not on its physical member. Remember it
+	# before the member mapping below and use it to discover IPv4/gateway.
+	source_interface=$TARGET_INTERFACE
 	# A PVE host's vmbrX is not a deployable interface. Resolve its physical
 	# bridge member first, then preserve the member name and all kernel altnames.
 	if [[ "$TARGET_INTERFACE" == vmbr* ]]; then
@@ -180,9 +184,15 @@ discover_configuration() {
 	TARGET_MAC=$(printf '%s' "$TARGET_MAC" | tr '[:upper:]' '[:lower:]')
 	[[ -n "$TARGET_IPV4_CIDR" ]] || \
 		TARGET_IPV4_CIDR=$(ip -4 -o addr show dev "$TARGET_INTERFACE" scope global | awk 'NR == 1 { print $4; exit }')
+	[[ -n "$TARGET_IPV4_CIDR" ]] || \
+		TARGET_IPV4_CIDR=$(ip -4 -o addr show dev "$source_interface" scope global | awk 'NR == 1 { print $4; exit }')
 	[[ -n "$TARGET_IPV4_CIDR" ]] || die 'cannot determine the current IPv4 address; set --ipv4'
 	[[ -n "$TARGET_GATEWAY" ]] || \
 		TARGET_GATEWAY=$(ip -4 route show default dev "$TARGET_INTERFACE" | awk 'NR == 1 { print $3; exit }')
+	[[ -n "$TARGET_GATEWAY" ]] || \
+		TARGET_GATEWAY=$(ip -4 route show default dev "$source_interface" | awk 'NR == 1 { print $3; exit }')
+	[[ -n "$TARGET_GATEWAY" ]] || \
+		TARGET_GATEWAY=$(ip -4 route show default | awk 'NR == 1 { print $3; exit }')
 	[[ -n "$TARGET_GATEWAY" ]] || die 'cannot determine the default gateway; set --gateway'
 	if [[ -z "$TARGET_DNS" ]]; then
 		nameserver=$(awk '/^nameserver[[:space:]]+/ { print $2 }' /etc/resolv.conf | paste -sd ';' -)
