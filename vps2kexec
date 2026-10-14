@@ -62,8 +62,8 @@ IMAGE_RAW_URL=
 RAW_FILE=
 RAW_SIZE=
 DROPBEAR_KEY=
-TARGET_NIC_DRIVER=
-TARGET_DISK_DRIVER=
+TARGET_NIC_DRIVERS=
+TARGET_DISK_DRIVERS=
 ROOT_SOURCE=
 SOURCE_DISK=
 STAGE=$WORKDIR/initramfs-root
@@ -274,33 +274,44 @@ discover_source() {
 	[[ "$(lsblk -dnro TYPE "$TARGET_DISK")" == disk ]] || die "$TARGET_DISK is not a whole disk"
 }
 
-# device_driver_module prints the module name backing a sysfs device node (the
-# first parent with a driver symlink). It is used to capture the storage and
-# network drivers that the running hardware needs so the kexec initramfs can
-# load them again on a physical machine, where those drivers are modules.
-device_driver_module() {
-	local node driver
-	node=$(readlink -f "$1" 2>/dev/null) || return 1
+# device_driver_modules prints the kernel module name of every driver in the
+# parent chain of a sysfs device node. The module name is read from the driver's
+# own module symlink, so it is the real module (sd -> sd_mod) rather than the
+# driver name, and drivers built into the kernel (no module symlink) are skipped
+# because the initramfs reuses the running kernel. The whole chain is captured
+# because a physical machine needs the leaf driver, the transport and the host
+# bus (for example sd_mod, virtio_scsi, virtio_pci), not only the first one.
+device_driver_modules() {
+	local node driver module
+	node=$(readlink -f "$1" 2>/dev/null) || return 0
 	while [[ -n "$node" && "$node" != / ]]; do
 		if [[ -L "$node/driver" ]]; then
-			driver=$(basename "$(readlink -f "$node/driver")")
-			if [[ -n "$driver" ]]; then
-				printf '%s\n' "$driver"
-				return 0
+			driver=$(readlink -f "$node/driver")
+			if [[ -L "$driver/module" ]]; then
+				module=$(basename "$(readlink -f "$driver/module")")
+				[[ -n "$module" ]] && printf '%s\n' "$module"
 			fi
 		fi
 		node=$(dirname "$node")
 	done
-	return 1
 }
 
-# block_driver_module resolves the driver for a whole block device. The disk
-# itself is handled by sd_mod/nvme/virtio_blk; walking up the device chain adds
-# the host controller (ahci, virtio_scsi, mpt3sas, ...), which is what a
-# module-based physical kernel needs.
-block_driver_module() {
-	local disk=${1##*/}
-	device_driver_module "/sys/class/block/$disk/device" 2>/dev/null || true
+# interface_device_node prints a sysfs device path for a network interface,
+# following bridge and bond masters down to the first member that has a device
+# node. A PVE vmbrX, a bond, or a stacked bridge has no /device of its own, so
+# without this the NIC driver would be missed on a physical host that bonds or
+# bridges its management interface.
+interface_device_node() {
+	local name=$1 member
+	while :; do
+		if [[ -e "/sys/class/net/$name/device" ]]; then
+			printf '%s\n' "/sys/class/net/$name/device"
+			return 0
+		fi
+		member=$(ip -o link show master "$name" 2>/dev/null | awk -F': |@' 'NR == 1 { print $2; exit }')
+		[[ -n "$member" ]] || return 1
+		name=$member
+	done
 }
 
 discover_configuration() {
@@ -346,15 +357,17 @@ discover_configuration() {
 	TARGET_DNS=${TARGET_DNS// /;}
 	[[ "$TARGET_DNS" == '' || "$TARGET_DNS" == *';' ]] || TARGET_DNS+=';'
 
-	# Capture the source NIC and storage drivers so /init can modprobe them on
-	# a physical machine whose kernel ships them as modules. On the PVE source
-	# kernel virtio_net is built in, so the NIC name is normally empty.
-	if [[ -z "$TARGET_NIC_DRIVER" ]]; then
-		TARGET_NIC_DRIVER=$(device_driver_module "/sys/class/net/$TARGET_INTERFACE/device" 2>/dev/null || true)
-		[[ -n "$TARGET_NIC_DRIVER" ]] || TARGET_NIC_DRIVER=$(device_driver_module "/sys/class/net/$TARGET_INTERFACE" 2>/dev/null || true)
+	# Capture the source NIC and storage driver modules so /init can modprobe
+	# them on a physical machine whose kernel ships them as modules. The whole
+	# driver chain is captured (virtio_net and virtio_pci; the storage leaf,
+	# transport and host bus) because a physical machine needs all of them.
+	if [[ -z "$TARGET_NIC_DRIVERS" ]]; then
+		if nic_node=$(interface_device_node "$TARGET_INTERFACE"); then
+			TARGET_NIC_DRIVERS=$(device_driver_modules "$nic_node" | sort -u | paste -sd ' ' -)
+		fi
 	fi
-	if [[ -z "$TARGET_DISK_DRIVER" ]]; then
-		TARGET_DISK_DRIVER=$(block_driver_module "$TARGET_DISK")
+	if [[ -z "$TARGET_DISK_DRIVERS" ]]; then
+		TARGET_DISK_DRIVERS=$(device_driver_modules "/sys/class/block/${TARGET_DISK##*/}/device" | sort -u | paste -sd ' ' -)
 	fi
 
 	[[ "$TARGET_HOSTNAME" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$ ]] || \
@@ -437,7 +450,7 @@ check_dependencies() {
 	for command_name in awk blockdev cp cpio findmnt gzip lsblk mount readlink rm sha256sum sfdisk sgdisk stat sync tr umount; do
 		need_command "$command_name"
 	done
-	for command_name in busybox dropbearkey hostname ip modinfo modprobe mountpoint paste; do
+	for command_name in busybox dropbearkey hostname ip modinfo modprobe mountpoint paste sort; do
 		need_command "$command_name"
 	done
 	# unsquashfs is only needed in embed mode when the source is an archive.
@@ -481,7 +494,7 @@ stage_binary_into() {
 module_names_to_stage() {
 	{
 		lsmod | awk 'NR > 1 { print $1 }'
-		printf '%s\n' "${TARGET_NIC_DRIVER:-}" "${TARGET_DISK_DRIVER:-}" \
+		printf '%s\n' ${TARGET_NIC_DRIVERS:-} ${TARGET_DISK_DRIVERS:-} \
 			loop ext4 vfat btrfs sd_mod scsi_mod
 	} | awk 'NF' | sort -u
 }
@@ -707,7 +720,7 @@ load_required_modules() {
 		printf '%s\n' '$MODALIAS=.* 0:0 0660 @modprobe $MODALIAS' > /etc/mdev.conf
 		mdev -s 2>/dev/null || true
 	fi
-	for mod in loop ext4 vfat sd_mod scsi_mod "${TARGET_DISK_DRIVER:-}" "${TARGET_NIC_DRIVER:-}"; do
+	for mod in loop ext4 vfat sd_mod scsi_mod ${TARGET_DISK_DRIVERS:-} ${TARGET_NIC_DRIVERS:-}; do
 		[ -n "$mod" ] || continue
 		modprobe "$mod" 2>/dev/null && log "loaded module $mod" || true
 	done
@@ -1220,8 +1233,8 @@ build_initramfs() {
 		printf 'TARGET_DNS=%q\n' "$TARGET_DNS"
 		printf 'TARGET_USER=%q\n' "$TARGET_USER"
 		printf 'TARGET_PASSWORD=%q\n' "$TARGET_PASSWORD"
-		printf 'TARGET_NIC_DRIVER=%q\n' "$TARGET_NIC_DRIVER"
-		printf 'TARGET_DISK_DRIVER=%q\n' "$TARGET_DISK_DRIVER"
+		printf 'TARGET_NIC_DRIVERS=%q\n' "$TARGET_NIC_DRIVERS"
+		printf 'TARGET_DISK_DRIVERS=%q\n' "$TARGET_DISK_DRIVERS"
 		printf 'ROOT_SIZE_GIB=%q\n' "$ROOT_SIZE_GIB"
 		printf 'CONFIG_SIZE_MIB=%q\n' "$CONFIG_SIZE_MIB"
 	} > "$STAGE/deploy.env"
