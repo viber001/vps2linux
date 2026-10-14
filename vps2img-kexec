@@ -80,10 +80,20 @@ INITRAMFS=$WORKDIR/initramfs.cpio.gz
 # so a non-apt source host (RHEL/openSUSE/...) can build it without preinstalling
 # the deploy tools.  Either way kexec loads the RUNNING kernel, so only the
 # userspace of the ramdisk is replaced.
-RAMDISK_SOURCE=${VPS2IMG_KEXEC_RAMDISK_SOURCE:-host}
+# Where the deploy ramdisk userspace comes from (see resolve_ramdisk_source):
+#   auto   (default) use the host tools when the host has them all, otherwise
+#          fetch the Debian installer components over HTTP
+#   host   force staging the running host's tools; fail if any are missing
+#   debian force the HTTP download (needs no host package manager)
+#   apt    install the missing host tools with apt-get, then stage the host
+RAMDISK_SOURCE=${VPS2IMG_KEXEC_RAMDISK_SOURCE:-auto}
 DI_MIRROR=${VPS2IMG_KEXEC_DI_MIRROR:-http://deb.debian.org/debian}
 DI_SUITE=${VPS2IMG_KEXEC_DI_SUITE:-stable}
 DI_ARCH=${VPS2IMG_KEXEC_DI_ARCH:-amd64}
+# Static busybox used only as a last-resort ar reader (see ar_command).  The
+# BusyBox project ships prebuilt static binaries, so this needs no package
+# manager and no ar to unpack.
+STATIC_BUSYBOX_URL=${VPS2IMG_KEXEC_STATIC_BUSYBOX_URL:-https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox}
 DI_DEB_INDEX=$WORKDIR/di-index-deb.txt
 DI_UDEB_INDEX=$WORKDIR/di-index-udeb.txt
 declare -A DI_PKG_FILE=()
@@ -140,11 +150,14 @@ Options:
                         the partition is extended to the end of the disk
   --kernel FILE         Kernel image loaded with kexec (default: /boot/vmlinuz-\$(uname -r))
   --ramdisk-source SRC  Where the deploy ramdisk userspace comes from:
-                        host (default): stage the running host's busybox and
-                        binaries; debian: fetch the Debian installer (d-i)
-                        netboot initrd plus the required .deb/.udeb packages
-                        over HTTP and assemble the ramdisk without the host
-                        package manager (for a non-apt source host)
+                        auto (default): stage the running host's tools when the
+                        host already has them all, otherwise download the Debian
+                        installer (d-i) components over HTTP;
+                        host: force the host tools, fail if any are missing;
+                        debian: force the HTTP download, needing no host package
+                        manager (for a non-apt source host such as Leap Micro);
+                        apt: install the missing host tools with apt-get, then
+                        stage the host (apt-based hosts only)
   --di-mirror URL       Debian mirror for the installer components
                         (default: http://deb.debian.org/debian)
   --di-suite NAME       Debian suite the installer components come from
@@ -303,6 +316,9 @@ prepare_image() {
 
 discover_source() {
 	ROOT_SOURCE=$(findmnt -nro SOURCE /) || die 'cannot determine the current root source'
+	# On a btrfs subvolume root findmnt prints the device with the subvolume,
+	# for example /dev/sda3[/@/.snapshots/3/snapshot]; lsblk needs the device.
+	ROOT_SOURCE=${ROOT_SOURCE%%\[*}
 	SOURCE_DISK=$(lsblk -sno PATH,TYPE "$ROOT_SOURCE" | awk '$2 == "disk" { print $1; exit }')
 	[[ -n "$SOURCE_DISK" ]] || die "cannot determine the disk containing $ROOT_SOURCE"
 	[[ -n "$TARGET_DISK" ]] || TARGET_DISK=$SOURCE_DISK
@@ -504,7 +520,7 @@ print_plan() {
 
 check_dependencies() {
 	local command_name archive
-	for command_name in awk ar blockdev cp cpio find findmnt gzip lsblk mount readlink rm sha256sum sfdisk stat sync tar tr umount; do
+	for command_name in awk blockdev cp cpio find findmnt gzip lsblk mount readlink rm sha256sum sfdisk stat sync tar tr umount; do
 		need_command "$command_name"
 	done
 	for command_name in hostname ip modinfo modprobe mountpoint paste sort; do
@@ -519,7 +535,7 @@ check_dependencies() {
 	# ensure_host_kexec and never through the host package manager.
 	if [[ "$RAMDISK_SOURCE" == host ]]; then
 		for command_name in busybox dropbearkey sgdisk; do
-			command -v "$command_name" >/dev/null 2>&1 || die "required command is missing: $command_name (install it, or use --ramdisk-source debian to fetch the tools over HTTP)"
+			command -v "$command_name" >/dev/null 2>&1 || die "required command is missing: $command_name (install it, or use --ramdisk-source auto or debian to fetch the tools over HTTP)"
 		done
 	fi
 	# unsquashfs is only needed in embed mode when the source is an archive.
@@ -529,6 +545,100 @@ check_dependencies() {
 			need_command unsquashfs
 		fi
 	fi
+}
+
+# ar_command returns an ar reader for .deb/.udeb members.  A minimal system
+# may ship no ar at all (openSUSE Leap Micro has no binutils) and its busybox
+# may lack the applet, so as a last resort download the static busybox the
+# BusyBox project publishes, instead of forcing a package onto the host.
+download_static_busybox() {
+	local path=$WORKDIR/busybox-static
+	if [[ ! -x "$path" ]]; then
+		download_file "$STATIC_BUSYBOX_URL" "$path" >&2 || die "cannot download a static busybox from $STATIC_BUSYBOX_URL"
+		chmod 0755 "$path"
+	fi
+	printf '%s\n' "$path"
+}
+
+ar_command() {
+	if command -v ar >/dev/null 2>&1; then
+		ar "$@"
+	elif command -v busybox >/dev/null 2>&1 && [[ " $(busybox --list 2>/dev/null | tr '\n' ' ') " == *' ar '* ]]; then
+		busybox ar "$@"
+	else
+		"$(download_static_busybox)" ar "$@"
+	fi
+}
+
+# host_tool_commands lists the tools that only host mode needs on the host,
+# beyond the base archive tooling that every mode requires.
+host_tool_commands() {
+	printf '%s\n' busybox dropbearkey kexec sgdisk
+}
+
+# host_tool_package maps a tool to the package that provides it, for --ramdisk-source apt.
+host_tool_package() {
+	case "$1" in
+		busybox) printf 'busybox\n' ;;
+		dropbearkey) printf 'dropbear\n' ;;
+		kexec) printf 'kexec-tools\n' ;;
+		sgdisk) printf 'gdisk\n' ;;
+		*) printf '%s\n' "$1" ;;
+	esac
+}
+
+# missing_host_tools prints, one per line, the host-mode tools that are absent.
+missing_host_tools() {
+	local command_name
+	for command_name in $(host_tool_commands); do
+		command -v "$command_name" >/dev/null 2>&1 || printf '%s\n' "$command_name"
+	done
+}
+
+# resolve_ramdisk_source turns the requested RAMDISK_SOURCE (auto, host, debian
+# or apt) into the effective host or debian mode.  auto prefers the host when
+# it already has every tool, otherwise it downloads; apt installs the missing
+# tools through apt-get first and then stages the host.  A system with no
+# package manager (openSUSE Leap Micro, for example) must use auto or debian.
+resolve_ramdisk_source() {
+	local command_name missing packages=()
+	case "$RAMDISK_SOURCE" in
+		host) ;;
+		debian) ;;
+		auto)
+			missing=$(missing_host_tools)
+			if [[ -z "$missing" ]]; then
+				printf '%s\n' 'Ramdisk source: the host already provides every tool; staging the host.'
+			else
+				printf 'Ramdisk source: the host lacks %s; fetching the Debian installer components over HTTP.\n' \
+					"$(printf '%s ' $missing | sed 's/ $//')"
+				RAMDISK_SOURCE=debian
+			fi
+			;;
+		apt)
+			command -v apt-get >/dev/null 2>&1 || \
+				die '--ramdisk-source apt needs apt-get, which this host does not provide (use auto or debian to download instead)'
+			missing=$(missing_host_tools)
+			if [[ -z "$missing" ]]; then
+				printf '%s\n' 'Ramdisk source: the host already provides every tool; staging the host.'
+			else
+				for command_name in $missing; do
+					packages+=("$(host_tool_package "$command_name")")
+				done
+				printf 'Ramdisk source: installing the missing host tools with apt-get: %s\n' "${packages[*]}"
+				# The update is best-effort: a host may have a repository that is
+				# unreachable (an unsubscribed Proxmox host, for example) while the
+				# packages we need are still installable from the cached indexes.
+				DEBIAN_FRONTEND=noninteractive apt-get update || \
+					warn 'apt-get update failed; installing from the existing package indexes'
+				DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" || die 'apt-get install failed'
+			fi
+			RAMDISK_SOURCE=host
+			;;
+		*)
+			die "invalid --ramdisk-source: $RAMDISK_SOURCE (use auto, host, debian or apt)"
+			;;
+	esac
 }
 
 # stage_binary_into copies an executable and every shared library it needs into
@@ -1358,14 +1468,14 @@ resolve_debian_packages() {
 # is needed, never the host package manager.
 extract_package_into() {
 	local archive=$1 destination=$2 member
-	member=$(ar t "$archive" | awk '/^data\.tar/{ print; exit }')
+	member=$(ar_command t "$archive" | awk '/^data\.tar/{ print; exit }')
 	[[ -n "$member" ]] || die "no data.tar member in $archive"
 	case "$member" in
-		*.tar.xz) ar p "$archive" "$member" | tar --no-same-owner -xJ -C "$destination" ;;
-		*.tar.zst) ar p "$archive" "$member" | tar --no-same-owner --zstd -x -C "$destination" ;;
-		*.tar.gz) ar p "$archive" "$member" | tar --no-same-owner -xz -C "$destination" ;;
-		*.tar.bz2) ar p "$archive" "$member" | tar --no-same-owner -xj -C "$destination" ;;
-		*.tar) ar p "$archive" "$member" | tar --no-same-owner -x -C "$destination" ;;
+		*.tar.xz) ar_command p "$archive" "$member" | tar --no-same-owner -xJ -C "$destination" ;;
+		*.tar.zst) ar_command p "$archive" "$member" | tar --no-same-owner --zstd -x -C "$destination" ;;
+		*.tar.gz) ar_command p "$archive" "$member" | tar --no-same-owner -xz -C "$destination" ;;
+		*.tar.bz2) ar_command p "$archive" "$member" | tar --no-same-owner -xj -C "$destination" ;;
+		*.tar) ar_command p "$archive" "$member" | tar --no-same-owner -x -C "$destination" ;;
 		*) die "unknown data.tar compression in $archive ($member)" ;;
 	esac
 }
@@ -1667,10 +1777,7 @@ parse_args() {
 main() {
 	parse_args "$@"
 	[[ $EUID -eq 0 ]] || die 'run as root'
-	case "$RAMDISK_SOURCE" in
-		host|debian) ;;
-		*) die "invalid --ramdisk-source: $RAMDISK_SOURCE (use host or debian)" ;;
-	esac
+	resolve_ramdisk_source
 	resolve_image_mode
 	check_dependencies
 	check_kexec_support
