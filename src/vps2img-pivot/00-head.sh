@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# vps2img-pivot - replace a running Linux installation with a raw Linux image.
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# The destructive part is deliberately split into a RAM-backed bootstrap.  A
+# running root filesystem must never write its own disk while that disk is
+# being replaced.
+
+umask 077
+
+PROGRAM=${0##*/}
+WORKDIR=${VPS2IMG_PIVOT_WORKDIR:-/var/tmp/vps2img-pivot}
+IMAGE_URL=${VPS2IMG_PIVOT_IMAGE_URL:-}
+IMAGE_FILE=${VPS2IMG_PIVOT_IMAGE_FILE:-}
+IMAGE_SHA256=${VPS2IMG_PIVOT_IMAGE_SHA256:-}
+TARGET_DISK=${VPS2IMG_PIVOT_DISK:-}
+TARGET_HOSTNAME=${VPS2IMG_PIVOT_HOSTNAME:-}
+TARGET_INTERFACE=${VPS2IMG_PIVOT_INTERFACE:-}
+TARGET_INTERFACE_NAMES=${VPS2IMG_PIVOT_INTERFACE_NAMES:-}
+TARGET_MAC=${VPS2IMG_PIVOT_MAC:-}
+TARGET_IPV4_CIDR=${VPS2IMG_PIVOT_IPV4_CIDR:-}
+TARGET_GATEWAY=${VPS2IMG_PIVOT_GATEWAY:-}
+TARGET_DNS=${VPS2IMG_PIVOT_DNS:-}
+SSH_KEY_FILE=${VPS2IMG_PIVOT_SSH_KEY_FILE:-/root/.ssh/authorized_keys}
+ROOT_SIZE_GIB=${VPS2IMG_PIVOT_ROOT_SIZE_GIB:-64}
+CONFIG_SIZE_MIB=${VPS2IMG_PIVOT_CONFIG_SIZE_MIB:-1024}
+RAW_FILE=
+ROOT_SOURCE=
+SOURCE_DISK=
+BOOTSTRAP=/run/vps2img-pivot-bootstrap
+

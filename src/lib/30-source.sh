@@ -1,0 +1,7 @@
+discover_source() {
+	ROOT_SOURCE=$(findmnt -nro SOURCE /) || die 'cannot determine the current root source'
+	SOURCE_DISK=$(lsblk -sno PATH,TYPE "$ROOT_SOURCE" | awk '$2 == "disk" { print $1; exit }')
+	[[ -n "$SOURCE_DISK" ]] || die "cannot determine the disk containing $ROOT_SOURCE"
+	[[ -n "$TARGET_DISK" ]] || TARGET_DISK=$SOURCE_DISK
+	[[ "$(lsblk -dnro TYPE "$TARGET_DISK")" == disk ]] || die "$TARGET_DISK is not a whole disk"
+}
