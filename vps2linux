@@ -285,7 +285,7 @@ stage_bootstrap() {
 	mount -t tmpfs -o "size=${bootstrap_size},mode=755" tmpfs "$BOOTSTRAP"
 	mkdir -p "$BOOTSTRAP"/{dev,proc,sys,run,etc}
 
-	for command_name in bash mount umount sync mkdir rm cp cat grep awk sed tr cut \
+	for command_name in bash mount umount mountpoint fsfreeze sync mkdir rm cp cat grep awk sed tr cut \
 		dd findmnt lsblk sha256sum sfdisk sgdisk blockdev stat losetup partx blkid \
 		lvchange vgchange chroot pivot_root reboot mkfs.ext4 chmod; do
 		command_file=$(command_path "$command_name")
@@ -364,14 +364,40 @@ for proc in /proc/[0-9]*; do
 done
 printf '%s\n' 'Old userspace frozen; continuing with target disk replacement.'
 
-# The old root is still mounted below /oldroot after pivot_root. Flush it and
-# switch its backing device to read-only, then detach it before touching the
-# disk. blockdev --setro is what actually protects the new image: it makes any
-# late writeback from the former root fail instead of overwriting the freshly
-# written data. An attempted mount -o remount,ro (which fails EBUSY while the
-# old root is busy) was observed to leave pending writeback that still landed
-# on disk after dd, so it is deliberately not attempted here.
+# The old root is still mounted below /oldroot after pivot_root. Before the
+# disk is touched, stop the two things that can still reach it after dd:
+#
+# 1. btrfs async discard. The old root is mounted discard=async and its
+#    background discard workqueue TRIMs free extents. On a zvol or SSD a TRIM
+#    zeroes the addressed sectors, so discarding the former root's free space
+#    also zeroes whatever the freshly written image now stores there,
+#    corrupting image files (observed as btrfs csum failures). Freezing the
+#    filesystem does not stop this workqueue. mount -o remount,ro fails EBUSY
+#    on the busy root, but a remount that only changes the discard option is
+#    accepted, so nodiscard is applied here while the device is still writable.
+# 2. The former root's own writeback. It is flushed and then frozen. btrfs
+#    holds its transaction commit while frozen, so dirty pages and metadata
+#    cannot be written back over the new data. The device must still be
+#    writable when fsfreeze runs (it flushes as part of freezing), so the
+#    read-only switch happens afterwards as a second line of defence.
+#
+# mount -o remount,ro is not attempted: it fails EBUSY while the old root is
+# busy and would leave writeback pending.
+if mount -o remount,nodiscard /oldroot 2>/dev/null; then
+	printf '%s\n' 'Former root async discard disabled; it can no longer zero new data.'
+else
+	printf '%s\n' 'WARNING: could not disable async discard on the former root.' >&2
+fi
 flush_disk
+if ! command -v fsfreeze >/dev/null 2>&1; then
+	printf '%s\n' 'WARNING: fsfreeze is unavailable; the new image may be corrupted by former root writeback.' >&2
+elif ! mountpoint -q /oldroot 2>/dev/null; then
+	fail '/oldroot is not a mount point; cannot freeze the former root'
+elif fsfreeze --freeze /oldroot; then
+	printf '%s\n' 'Former root filesystem frozen; writeback is disabled.'
+else
+	fail 'cannot freeze the former root; refusing to overwrite the target disk'
+fi
 if [[ -n "${VPS2LINUX_ROOT_SOURCE:-}" && -b "$VPS2LINUX_ROOT_SOURCE" ]]; then
 	blockdev --setro "$VPS2LINUX_ROOT_SOURCE" || \
 		printf '%s\n' "WARNING: cannot make old root read-only: $VPS2LINUX_ROOT_SOURCE" >&2

@@ -108,6 +108,20 @@ sda4  ext4，label=combustion，扩展到磁盘末尾，不留空闲空间
 - QEMU/zvol 可能保留旧 kernel partition mapping；不能只看当场的 `sfdisk` 输出，必须在重启/关机后从外部系统再次检查 on-disk GPT。
 - 在将 flush/只读/GPT 流程用于真实物理机前，必须先在 disposable VM 中取得完整成功结果。
 
+## 下一步开发计划（方案 2：kexec + 自制 initramfs）
+
+当前 `pivot_root` 到 RAM tmpfs 的“RAM bootstrap”并不能真正剥夺旧系统对目标盘的访问：旧 systemd/PID1 仍然存活，旧 btrfs 的 async discard 和 writeback 会在 `dd` 之后继续写回目标盘。现已用轻量缓解压制（内层部署先 `mount -o remount,nodiscard /oldroot` 关闭 async discard，再强制 `fsfreeze`、`blockdev --setro`、`umount -Rl`），但这仍是权宜之计。
+
+方案 2 用真正的内核切换替代 `pivot_root`：
+
+1. 构建自制 initramfs（cpio + gzip/zstd），内置 `busybox`（提供 sh、dd、sfdisk、sgdisk、mkfs 等所需 applet）以及脚本需要的其他二进制和动态库。
+2. 目标 raw image 内置进 initramfs，或在 initramfs 内通过 RAM 网络获取（配置临时静态 IP，HTTP 下载并校验 SHA256）；受 initramfs 大小限制时优先“RAM 内网络获取”。
+3. 用 `kexec -l` 加载新内核与 initramfs，`kexec -e` 直接切换；旧内核、旧 systemd、旧 btrfs 被完整废弃，不再有旧 root 的 discard/writeback。
+4. 新 initramfs 的 PID1 负责识别目标盘、按 `--root-size-gib` 重建 GPT、写入 image、创建 Combustion 分区并写入配置、创建 EFI 启动项，最后 `reboot -f`。
+5. 复用现有的只读计划、`--execute`/`VPS2LINUX_CONFIRM` 双重保护、参数校验和 Combustion 生成逻辑。
+
+要点：kexec 需要内核支持，且加载的内核与 initramfs 必须匹配；initramfs 必须自带 GPT 和文件系统工具；网络下载需要 initramfs 内有网卡驱动和 DHCP 或静态网络配置。建议以参数开关（例如 `--boot-method kexec`）与现有 `pivot_root` 路径并存，先在 disposable VM 中验证后再考虑设为默认。
+
 ## 安全规则
 
 - 不要移除 `--execute` 或 `VPS2LINUX_CONFIRM` 双重保护。
