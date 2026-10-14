@@ -66,19 +66,21 @@ VPS2LINUX_CONFIRM=WIPE:/dev/sda \
 
 要求：
 
-- 源主机已安装 `kexec-tools`、`busybox-static`、`cpio`、`gzip`、`squashfs-tools`、`gdisk`/`sgdisk`。
+- 源主机已安装 `kexec-tools`、`dropbear`、`busybox-static`、`cpio`、`gzip`、`squashfs-tools`、`gdisk`/`sgdisk`。
 - Secure Boot 必须关闭：`/sys/kernel/security/lockdown` 中不能含 `[integrity]` 或 `[confidentiality]`，否则脚本直接退出。
-- initramfs 使用内核内置驱动即可（ext4、virtio、squashfs、efivarfs 等），无需额外内核模块。
-- `kexec -c -l` 使用 compat 系统调用（`kexec_load`），因为大 initramfs（约 1.5 GiB）在 `kexec_file_load` 下会以 `Cannot assign requested address` 失败。
+- initramfs 使用内核内置驱动即可（ext4、virtio、squashfs、efivarfs 等），无需额外内核模块；脚本仍会记录源网卡驱动名并在 `/init` 里 `modprobe` 一次作为无副作用保险。
+- `kexec -c -l` 使用 compat 系统调用（`kexec_load`），因为大 initramfs 在 `kexec_file_load` 下会以 `Cannot assign requested address` 失败。
 
-raw image 可以随 initramfs 内嵌（`VPS2KEXEC_IMAGE_MODE=embed`，默认），或在 initramfs 内通过临时静态 IP 从 HTTP 下载并校验 SHA256（`VPS2KEXEC_IMAGE_MODE=net`）。
+默认 `--image-mode stream`：initramfs 保持极小（busybox + 少量工具，几 MB），raw image 通过 HTTP 直接流式写入目标盘（`wget -O - <url> | dd of=<disk> bs=4M`），任何时候都不把整块 image 放进 RAM；随后从目标盘回读前 `--image-size` 字节做 SHA-256 校验（未给出 `--image-size` 时用 HTTP `Content-Length` 推导）。`--image-mode embed` 把整块 image 内嵌进 initramfs，仅作为显式的非默认选项保留，非常耗内存。
+
+Combustion 的 `/combustion/script` 会配置登录用户名、密码、SSH key、hostname、静态 IPv4/网关/DNS，并启用 `sshd` 和 `NetworkManager`。用户名通过 `--user` 指定（默认 `root`），密码通过 `--password` 指定（可选，设置后同时开启公钥和密码登录）。
 
 与 `vps2linux` 相同：默认只生成只读计划；破坏性执行必须同时提供 `--execute` 和环境变量 `VPS2KEXEC_CONFIRM=WIPE:<disk>`。`--stage-test` 只构建 initramfs 并 `kexec -l` 装载再卸载，不切换内核。
 
 ```bash
 VPS2KEXEC_CONFIRM=WIPE:/dev/sda \
   ./vps2kexec --execute \
-  --image-file /var/tmp/vps2kexec/image.raw \
+  --image-url 'http://10.68.247.224:18080/openSUSE-Leap-Micro.raw' \
   --sha256 "$RAW_IMAGE_SHA256" \
   --disk /dev/sda \
   --hostname pve1-leap-test \
@@ -86,11 +88,12 @@ VPS2KEXEC_CONFIRM=WIPE:/dev/sda \
   --ipv4 10.68.247.161/24 \
   --gateway 10.68.247.199 \
   --dns 172.18.202.2 \
+  --user leap --password '<password>' \
   --ssh-key-file /root/.ssh/authorized_keys \
   --root-size-gib 40
 ```
 
-执行路径已在 VM 600 上端到端验证：`kexec -e` 后 initramfs 重建 GPT、写入 image、创建 Combustion 分区，重启后由 `efibootmgr` 的 `vps2kexec` 启动项引导 Leap Micro，Combustion 首启生效（hostname、可预测网卡上的静态 IP、`authorized_keys`），且 Btrfs 无损坏。
+执行路径已在 VM 600 上端到端验证：`kexec -e` 后 initramfs 流式写入 image、重建 GPT 并创建直达磁盘末尾的 Combustion 分区（不留未分配空间，使 KIWI 首启跳过重分区），重启后由 `efibootmgr` 的 `vps2kexec` 启动项引导 Leap Micro；Combustion 首启生效（hostname、用户名/密码、静态 IP、`authorized_keys`），且首启后 Combustion 分区仍然存在、Btrfs 无损坏。
 
 ## 安全边界
 
