@@ -54,6 +54,10 @@ discover_configuration() {
 
 	[[ "$TARGET_HOSTNAME" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$ ]] || \
 		die "invalid target hostname: $TARGET_HOSTNAME"
+	[[ "$TARGET_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || \
+		die "invalid target user: $TARGET_USER"
+	[[ "$TARGET_PASSWORD" != *$'\n'* && "$TARGET_PASSWORD" != *$'\r'* ]] || \
+		die 'the target password may not contain a newline'
 	[[ "$TARGET_INTERFACE" =~ ^[A-Za-z0-9_.:-]+$ ]] || \
 		die "invalid target interface: $TARGET_INTERFACE"
 	[[ "$TARGET_INTERFACE_NAMES" =~ ^[A-Za-z0-9_.:-]+(,[A-Za-z0-9_.:-]+)*$ ]] || \
@@ -90,6 +94,7 @@ print_plan() {
 	printf 'raw image:      %s (%s bytes)\n' "$RAW_FILE" "$size_bytes"
 	printf 'target hostname: %s\n' "$TARGET_HOSTNAME"
 	printf 'target network:  %s (%s) names=%s %s via %s DNS %s\n' "$TARGET_INTERFACE" "$TARGET_MAC" "$TARGET_INTERFACE_NAMES" "$TARGET_IPV4_CIDR" "$TARGET_GATEWAY" "${TARGET_DNS:-none}"
+	printf 'login user:      %s\n' "$TARGET_USER"
 	printf 'root/config:     %s GiB Btrfs / Combustion to end of disk (min %s MiB)\n' "$ROOT_SIZE_GIB" "$CONFIG_SIZE_MIB"
 	printf 'SSH keys:        %s\n' "$SSH_KEY_FILE"
 	printf 'raw partition table:\n'
@@ -165,6 +170,8 @@ TARGET_MAC=$(printf '%q' "$TARGET_MAC")
 TARGET_IPV4_CIDR=$(printf '%q' "$TARGET_IPV4_CIDR")
 TARGET_GATEWAY=$(printf '%q' "$TARGET_GATEWAY")
 TARGET_DNS=$(printf '%q' "$TARGET_DNS")
+TARGET_USER=$(printf '%q' "$TARGET_USER")
+TARGET_PASSWORD=$(printf '%q' "$TARGET_PASSWORD")
 ROOT_SIZE_GIB=$(printf '%q' "$ROOT_SIZE_GIB")
 CONFIG_SIZE_MIB=$(printf '%q' "$CONFIG_SIZE_MIB")
 EOF

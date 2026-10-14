@@ -1,0 +1,100 @@
+# Provision the requested login user, its password and its SSH key. Leap
+# Micro's Combustion chroots into the target root before running this script
+# (so ROOT is usually /); when a /sysroot layout is used instead, run the
+# account tools through chroot so they still act on the target.
+TARGET_USER='$TARGET_USER'
+TARGET_PASSWORD='$TARGET_PASSWORD'
+run_in_target() {
+	if [[ "\$ROOT" == / ]]; then
+		"\$@"
+	else
+		chroot "\$ROOT" "\$@"
+	fi
+}
+ensure_user() {
+	local user=\$TARGET_USER home uid_gid
+	if [[ "\$user" != root ]] && ! grep -q "^\$user:" "\$ROOT/etc/passwd"; then
+		run_in_target /usr/sbin/useradd -m -s /bin/bash "\$user" || \
+			run_in_target /usr/sbin/useradd -m "\$user"
+	fi
+	if [[ -n "\$TARGET_PASSWORD" ]]; then
+		printf '%s:%s\n' "\$user" "\$TARGET_PASSWORD" | run_in_target /usr/sbin/chpasswd
+	fi
+	home=\$(awk -F: -v u="\$user" '\$1==u{print \$6}' "\$ROOT/etc/passwd")
+	[[ -n "\$home" ]] || home=/root
+	uid_gid=\$(awk -F: -v u="\$user" '\$1==u{print \$3":"\$4}' "\$ROOT/etc/passwd")
+	mkdir -p "\$ROOT\$home/.ssh"
+	cat > "\$ROOT\$home/.ssh/authorized_keys" <<'USERKEYS'
+$AUTHORIZED_KEYS
+USERKEYS
+	chmod 700 "\$ROOT\$home/.ssh"
+	chmod 600 "\$ROOT\$home/.ssh/authorized_keys"
+	if [[ -n "\$uid_gid" ]]; then
+		chown -R "\$uid_gid" "\$ROOT\$home/.ssh"
+	fi
+	# /home is a separate btrfs subvolume on Leap Micro and is NOT part of a
+	# transactional-update snapshot, so a key written under the user home here
+	# is shadowed on the first real boot. /etc IS captured by the snapshot, so
+	# also install the key under /etc/ssh/authorized_keys.d and let sshd read it
+	# (AuthorizedKeysFile drop-in below); a firstboot unit recreates the real
+	# ~/.ssh on the /home subvolume.
+	mkdir -p "\$ROOT/etc/ssh/authorized_keys.d"
+	cat > "\$ROOT/etc/ssh/authorized_keys.d/\$user" <<'USERKEYS'
+$AUTHORIZED_KEYS
+USERKEYS
+	chmod 644 "\$ROOT/etc/ssh/authorized_keys.d/\$user"
+	chown root:root "\$ROOT/etc/ssh/authorized_keys.d/\$user"
+	chmod 755 "\$ROOT/etc/ssh/authorized_keys.d"
+}
+ensure_user
+
+# The user home lives on the /home subvolume, which Combustion cannot write
+# (see above). Materialize ~/.ssh there on the first real boot from the copy
+# under /etc, so the requested user ends up with a working authorized_keys.
+if [[ '$TARGET_USER' != root ]]; then
+	mkdir -p "\$ROOT/etc/systemd/system"
+	cat > "\$ROOT/etc/systemd/system/@PROGRAM@-user-home.service" <<UNIT
+[Unit]
+Description=Create home and SSH authorized_keys for $TARGET_USER
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/install -d -m 0700 -o $TARGET_USER -g $TARGET_USER /home/$TARGET_USER/.ssh
+ExecStart=/usr/bin/install -m 0600 -o $TARGET_USER -g $TARGET_USER /etc/ssh/authorized_keys.d/$TARGET_USER /home/$TARGET_USER/.ssh/authorized_keys
+ExecStart=/usr/bin/chown -R $TARGET_USER:$TARGET_USER /home/$TARGET_USER
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+	systemctl --root="\$ROOT" enable @PROGRAM@-user-home.service
+fi
+
+mkdir -p "\$ROOT/etc/ssh/sshd_config.d"
+cat > "\$ROOT/etc/ssh/sshd_config.d/90-@PROGRAM@.conf" <<SSHD
+PermitRootLogin $SSHD_ROOT_LOGIN
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys /etc/ssh/authorized_keys.d/%u
+PasswordAuthentication $SSHD_PASSWORD_AUTH
+SSHD
+
+# Add the created user to wheel and let the group run sudo with the caller's
+# own password. openSUSE ships `Defaults targetpw`, so a plain `%wheel` rule
+# would still ask for ROOT's password; override it for the group.
+if [[ '$TARGET_USER' != root ]]; then
+	run_in_target usermod -aG wheel '$TARGET_USER' 2>/dev/null || \
+		run_in_target gpasswd -a '$TARGET_USER' wheel 2>/dev/null || true
+	if [[ -e "\$ROOT/usr/etc/sudoers" || -e "\$ROOT/etc/sudoers" ]]; then
+		mkdir -p "\$ROOT/etc/sudoers.d"
+		cat > "\$ROOT/etc/sudoers.d/wheel" <<'SUDOERS'
+Defaults:%wheel !targetpw
+%wheel ALL=(ALL:ALL) ALL
+SUDOERS
+		chmod 0440 "\$ROOT/etc/sudoers.d/wheel"
+		chown root:root "\$ROOT/etc/sudoers.d/wheel"
+	fi
+fi
+
+systemctl --root="\$ROOT" enable sshd.service
+systemctl --root="\$ROOT" enable NetworkManager.service

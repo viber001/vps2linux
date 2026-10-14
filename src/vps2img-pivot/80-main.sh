@@ -68,6 +68,15 @@ mkfs.ext4 -F -L combustion "$CONFIG_LOOP"
 mkdir -p /run/config
 mount "$CONFIG_LOOP" /run/config
 mkdir -p /run/config/combustion
+# sshd policy: password authentication is enabled only when a password was
+# requested, and root password login only when the requested user is root.
+SSHD_PASSWORD_AUTH=no
+SSHD_ROOT_LOGIN=prohibit-password
+if [[ -n "$TARGET_PASSWORD" ]]; then
+	SSHD_PASSWORD_AUTH=yes
+	[[ "$TARGET_USER" != root ]] || SSHD_ROOT_LOGIN=yes
+fi
+
 (#@HEREDOC@expand) cat > /run/config/combustion/script <<COMBUSTION | src/assets/combustion-pivot.sh
 chmod 0700 /run/config/combustion/script
 sync
@@ -147,6 +156,8 @@ parse_args() {
 			--ipv4) TARGET_IPV4_CIDR=${2:?missing value for --ipv4}; shift 2 ;;
 			--gateway) TARGET_GATEWAY=${2:?missing value for --gateway}; shift 2 ;;
 			--dns) TARGET_DNS=${2:?missing value for --dns}; shift 2 ;;
+			--user) TARGET_USER=${2:?missing value for --user}; shift 2 ;;
+			--password) TARGET_PASSWORD=${2:?missing value for --password}; shift 2 ;;
 			--ssh-key-file) SSH_KEY_FILE=${2:?missing value for --ssh-key-file}; shift 2 ;;
 			--root-size-gib) ROOT_SIZE_GIB=${2:?missing value for --root-size-gib}; shift 2 ;;
 			--config-size-mib) CONFIG_SIZE_MIB=${2:?missing value for --config-size-mib}; shift 2 ;;

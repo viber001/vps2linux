@@ -17,6 +17,9 @@ Options:
   --ipv4 CIDR           Static IPv4 address, for example 10.0.0.20/24
   --gateway ADDRESS     IPv4 gateway written by Combustion
   --dns ADDRESS         DNS server(s), separated by commas or semicolons
+  --user NAME           Login user created by Combustion (default: root)
+  --password VALUE      Password for --user; when set, password SSH login is
+                        enabled as well as the SSH key
   --ssh-key-file FILE   authorized_keys source (default: /root/.ssh/authorized_keys)
   --root-size-gib N     Btrfs partition size (default: 64)
   --config-size-mib N   Minimum Combustion partition size (default: 1024);
