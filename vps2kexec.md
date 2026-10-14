@@ -26,7 +26,7 @@
 1. 识别当前 root、底层 whole disk、网络接口（bridge 映射到物理 member）。
 2. 下载 raw image（或从 HTTP 流式，见阶段 B）并校验 SHA256。
 3. 生成只读计划；只有 `--execute` 与 `VPS2KEXEC_CONFIRM=WIPE:<disk>` 同时存在才继续。
-4. 构建自制 initramfs（cpio + gzip），用 `kexec -l` 加载源内核 + 该 initramfs，`kexec -e` 切换。
+4. 构建自制 initramfs（cpio + gzip），用 `kexec -s -l`（`kexec_file_load`）加载源内核 + 该 initramfs，`kexec -e` 切换。
 
 ### 阶段 B：RAM initramfs 的 PID1
 
@@ -95,21 +95,23 @@ ISO 内的证据（`http://10.68.247.14:16000/eiso/id/3/`）：
 
 **关键点**：官方自安装**不使用 `kexec`**，它由固件直接引导已签名的安装内核，安装内核自己写盘后重启。整条链都已签名，所以 Secure Boot 无需关闭。
 
-而 `vps2kexec` 需要关闭 Secure Boot，原因是：
+`vps2kexec` 在 Secure Boot 开启时通过 `kexec_file_load` 工作，**无需关闭 Secure Boot**：
 
-- 启用 Secure Boot 时内核进入 lockdown，`kexec_load`（旧 syscall，`kexec -c` 走这条）被拒绝，报 `kexec_load failed: Operation not permitted on UEFI SecureBoot`；
-- 我们 `kexec` 的是**自制、未签名**的 initramfs，无法通过签名校验。
+- 启用 Secure Boot 时内核进入 lockdown，只允许 `kexec_file_load`（`kexec -s`），禁止旧 syscall `kexec_load`（`kexec -c`，会报 `kexec_load failed: Operation not permitted on UEFI SecureBoot`）。
+- `kexec_file_load` 要求被加载的内核镜像已被固件信任或签名。脚本默认加载**当前正在运行的内核**（`/boot/vmlinuz-$(uname -r)`，可用 `--kernel` 覆盖），它已经在 Secure Boot 下启动，因此是受信任的；自制 initramfs 作为数据附加，不参与内核签名校验。
+- 因此 `run_kexec` 与 `--stage-test` 默认先尝试 `kexec -s -l`；只有 `-s` 失败且系统未处于 lockdown 时才回退到 `kexec -c -l`（打印明确提示）。lockdown 检测不再致命，只告警并走 `-s` 路径。
 
-可选未来方向：改用 `kexec_file_load`（`kexec -s`）加载**镜像自带的已签名内核** + 我们的 initramfs。lockdown 只禁止 `kexec_load`，允许 `kexec_file_load` 加载已签名内核（initramfs 作为数据附加）。这样在 Secure Boot 开启时也能完成安装。当前脚本用 `kexec -c`，是已知限制。
+> 注意：`kexec_file_load` 加载的内核必须是当前运行的内核（或镜像自带的已签名内核）。换用未签名的自定义内核在 Secure Boot 下仍会被拒绝。
 
 ## 已验证范围
 
 - VM 600（PVE ext4+LVM 源）、VM 602（PVE Btrfs 源）：`kexec -e` → 流式写盘 → Combustion → 重启 → Leap Micro 启动，hostname/网络/用户/密码/SSH key/sudo 全部生效，Btrfs 无损坏，Combustion 分区首启后仍在。
+- VM 600 在 **Secure Boot 开启**（`mokutil --sb-state` = `SecureBoot enabled`，lockdown integrity）下：`--stage-test` 用 `kexec_file_load`（`-s`）加载 23.7 MiB initramfs 成功，完整 `--execute` 部署进入 Leap Micro 6.2，目标端 Secure Boot 仍为 enabled。
 - 物理机 c49（Inspur NS5488M5 节点，Debian 13 + PVE 源）：驱动按整条设备链收集，`eno2` 物理网卡上电，部署成功进入 Leap Micro。
 
 ## 已知限制
 
-- 需要关闭 Secure Boot（见上）；物理机需在其固件里关闭。
+- 需要关闭 Secure Boot 仅当你用 `--kernel` 指定了一个非当前运行的、未签名/未受信任的内核；默认加载当前运行内核时 Secure Boot 可保持开启（见上）。
 - 源系统需预装 `kexec-tools`、`dropbear`、`busybox-static`。
 - 驱动收集只在 virtio 与 Inspur 的网卡/磁盘路径上验证过，其他 AHCI/NVMe/RAID 控制器尚待在物理机验证。
 - 这是破坏性实验工具，默认只探测与 dry-run；目标盘必须有独立控制台、救援介质或可回滚快照。
