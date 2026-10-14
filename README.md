@@ -34,7 +34,10 @@ http://10.68.247.14:16000/eiso/id/3/
 
 ## 当前用法
 
-两个入口脚本由 `src/` 片段经 `make` 生成（生成物已加入 `.gitignore`，不随仓库提交）：
+两个入口脚本 `vps2img-pivot` 与 `vps2img-kexec` 由 `src/` 片段经 `make`（`tools/build.py`）生成：
+
+- 开发分支 `main` 只跟踪 `src/`、`tools/`、`Makefile` 与文档，构建产物被 `.gitignore` 忽略，使用前先 `make`。
+- 发布分支 `dist` 直接提交构建好的脚本，克隆即可用，无需 `make`。
 
 ```bash
 make            # 生成 ./vps2img-pivot 和 ./vps2img-kexec
@@ -73,9 +76,9 @@ VPS2IMG_PIVOT_CONFIRM=WIPE:/dev/sda \
 
 要求：
 
-- 源主机已安装 `kexec-tools`、`dropbear`、`busybox-static`、`cpio`、`gzip`、`gdisk`/`sgdisk`（`--image-mode stream` 直接流式写 raw image，不需要 `squashfs-tools`）。
 - 内核需支持 kexec（`kexec_load` 自 Linux 2.6.13，`kexec_file_load` 自 3.17）：物理机、KVM/Xen/HN 可用，容器（OpenVZ/LXC）不可用。
 - 默认用 `kexec_file_load`（`kexec -s -l`）加载**当前正在运行的内核**，因此 **Secure Boot 可以保持开启**（lockdown 只禁止旧的 `kexec_load`）。仅当 `-s` 失败且系统未处于 lockdown 时才回退到 `kexec -c -l`；`--kernel` 指定未签名内核时仍需关闭 Secure Boot。
+- ramdisk 用户态默认 `--ramdisk-source auto`：宿主工具齐全时 staging 宿主，否则经 HTTP 下载 d-i 组件组装。宿主至少需要 `cpio`、`gzip`、`gdisk`/`sgdisk`（`--image-mode stream` 直接流式写 raw image，不需要 `squashfs-tools`）。详见下文。
 - initramfs 按整条设备链收集在用驱动模块（`lsmod` + 目标磁盘/网卡驱动闭包）和固件，以便在物理机上启动；内核内置的驱动自动跳过。
 
 默认 `--image-mode stream`：initramfs 保持极小（busybox + 少量工具，几 MB），raw image 通过 HTTP 直接流式写入目标盘（`wget -O - <url> | dd of=<disk> bs=4M`），任何时候都不把整块 image 放进 RAM；随后从目标盘回读前 `--image-size` 字节做 SHA-256 校验（未给出 `--image-size` 时用 HTTP `Content-Length` 推导）。`--image-mode embed` 把整块 image 内嵌进 initramfs，仅作为显式的非默认选项保留，非常耗内存。
@@ -104,9 +107,18 @@ VPS2IMG_KEXEC_CONFIRM=WIPE:/dev/sda \
 
 ### initramfs 用户态来源（`--ramdisk-source`）
 
-部署 ramdisk 的用户态默认取自**运行中的宿主**（`host`）：打包宿主的 busybox、dropbear 等二进制与库，因此宿主需预装 `busybox`、`dropbear`、`sgdisk`（例如 Debian 上 `apt-get install -y kexec-tools dropbear busybox-static`）。kexec 始终加载**正在运行的内核**，所以替换的只是 ramdisk 用户态，内核与模块始终匹配。
+部署 ramdisk 的用户态来源可选，按需选择：
 
-在**非 apt 源**（RHEL/openSUSE 等）或不想预装工具的机器上，可用 `--ramdisk-source debian`：从 Debian 安装器（d-i）的 netboot initrd 与普通 `.deb/.udeb` 包经 HTTP 获取并自行组装 ramdisk，完全不经过宿主包管理器。`--di-mirror`（默认 `http://deb.debian.org/debian`）、`--di-suite`（默认 `stable`）、`--di-arch`（默认 `amd64`）选择 d-i 源。该路径已在 VM 602 上验证（构建时把 `apt`/`apt-get`/`dpkg`/`dpkg-deb` 全部移走，仍能组装并完成部署）。
+- `auto`（默认）：宿主已具备全部所需工具时 staging 宿主（等价 `host`），否则自动改为经 HTTP 下载组装（等价 `debian`）。
+- `host`：强制 staging 运行中的宿主（`busybox`/`dropbear`/`kexec`/`sgdisk` 等）；缺任一工具则报错。
+- `debian`：强制从 Debian 安装器（d-i）的 netboot initrd 与普通 `.deb/.udeb` 经 HTTP 获取并自行组装，完全不经过宿主包管理器，适用于非 apt 源（如 openSUSE Leap Micro）。
+- `apt`：先用 `apt-get` 补齐缺失的宿主工具，再 staging 宿主（仅 apt 宿主可用；`apt-get update` 失败仅告警，便于无订阅的 PVE 源）。
+
+kexec 始终加载**正在运行的内核**，替换的只是 ramdisk 用户态，内核与模块始终匹配。
+
+读 `.deb/.udeb` 需要 `ar`；若宿主没有 `ar`（如 Leap Micro 无 binutils），依次回退到宿主 busybox 的 `ar` applet、再回退到下载 busybox.net 发布的静态 busybox，因此无需任何宿主包。
+
+`--di-mirror`（默认 `http://deb.debian.org/debian`）、`--di-suite`（默认 `stable`）、`--di-arch`（默认 `amd64`）选择 d-i 源。`debian`/`auto` 路径已在 openSUSE Leap Micro 源（无 apt、无 ar）上端到端验证，`apt` 路径已在 PVE Debian 源上验证。
 
 ```bash
 VPS2IMG_KEXEC_CONFIRM=WIPE:/dev/sda \
