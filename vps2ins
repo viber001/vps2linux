@@ -1,0 +1,1696 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# vps2kexec - replace a running Linux installation with a raw Linux image by
+# booting a self-made initramfs with kexec.
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Plan 2 of vps2linux.  The pivot_root bootstrap of vps2linux cannot actually
+# stop the old kernel from writing the target disk: old systemd, old btrfs
+# async discard and old writeback keep touching the device after dd.  This
+# script instead loads the running kernel plus a purpose-built initramfs with
+# kexec and calls kexec -e, so the old kernel, systemd and btrfs are fully
+# discarded before a single sector of the target disk is written.
+#
+# The generated initramfs is deliberately tiny: a static busybox, the staged
+# deploy tools (sfdisk, sgdisk, losetup, mke2fs, partx, lsblk, findmnt,
+# efibootmgr), a small dropbear sshd, bash and the deploy scripts.  The raw
+# image is NOT carried in RAM.  By default it is streamed straight from an HTTP
+# URL to the target disk inside the initramfs:
+#
+#   wget -O - <url> | dd of=<disk> bs=4M
+#
+# and then verified by reading the first Content-Length bytes back from the
+# disk and comparing SHA-256.  This keeps the RAM footprint small enough for a
+# real VPS.  Embedding the image inside the initramfs is still available as an
+# explicit, RAM-heavy --image-mode embed opt-in.
+#
+# /init is PID 1; it brings up the network (matched by MAC), starts dropbear so
+# a headless box can be debugged over SSH, streams and verifies the image, then
+# runs /deploy, which rebuilds the GPT, creates the Combustion partition and the
+# EFI boot entry.  On any failure it stays alive with SSH instead of dying.
+#
+# The destructive part keeps the same contract as vps2linux: the default is a
+# read-only plan, and writing requires both --execute and
+# VPS2KEXEC_CONFIRM=WIPE:<disk>.
+
+umask 077
+
+PROGRAM=${0##*/}
+WORKDIR=${VPS2KEXEC_WORKDIR:-/var/tmp/vps2kexec}
+IMAGE_URL=${VPS2KEXEC_IMAGE_URL:-}
+IMAGE_FILE=${VPS2KEXEC_IMAGE_FILE:-}
+IMAGE_SHA256=${VPS2KEXEC_IMAGE_SHA256:-}
+IMAGE_SIZE=${VPS2KEXEC_IMAGE_SIZE:-}
+IMAGE_MODE_REQUEST=${VPS2KEXEC_IMAGE_MODE:-auto}
+TARGET_DISK=${VPS2KEXEC_DISK:-}
+TARGET_HOSTNAME=${VPS2KEXEC_HOSTNAME:-}
+TARGET_INTERFACE=${VPS2KEXEC_INTERFACE:-}
+TARGET_INTERFACE_NAMES=${VPS2KEXEC_INTERFACE_NAMES:-}
+TARGET_MAC=${VPS2KEXEC_MAC:-}
+TARGET_IPV4_CIDR=${VPS2KEXEC_IPV4_CIDR:-}
+TARGET_GATEWAY=${VPS2KEXEC_GATEWAY:-}
+TARGET_DNS=${VPS2KEXEC_DNS:-}
+TARGET_USER=${VPS2KEXEC_USER:-root}
+TARGET_PASSWORD=${VPS2KEXEC_PASSWORD:-}
+SSH_KEY_FILE=${VPS2KEXEC_SSH_KEY_FILE:-/root/.ssh/authorized_keys}
+ROOT_SIZE_GIB=${VPS2KEXEC_ROOT_SIZE_GIB:-64}
+CONFIG_SIZE_MIB=${VPS2KEXEC_CONFIG_SIZE_MIB:-1024}
+KEXEC_KERNEL=${VPS2KEXEC_KERNEL:-}
+IMAGE_MODE=
+IMAGE_RAW_URL=
+RAW_FILE=
+RAW_SIZE=
+DROPBEAR_KEY=
+DROPBEAR_BIN=
+KEXEC_BIN=
+TARGET_NIC_DRIVERS=
+TARGET_DISK_DRIVERS=
+KEXEC_METHOD=
+KEXEC_LOCKDOWN=0
+ROOT_SOURCE=
+SOURCE_DISK=
+STAGE=$WORKDIR/initramfs-root
+INITRAMFS=$WORKDIR/initramfs.cpio.gz
+
+# vps2ins: where the deploy ramdisk's userspace comes from.  "debian" (default)
+# fetches the Debian installer (d-i) netboot initrd plus the required
+# .deb/.udeb packages over plain HTTP and assembles the ramdisk without ever
+# touching the host package manager, so a non-apt source host (RHEL/openSUSE/
+# ...) can build it.  "host" is the vps2leapmicro behaviour (stage the running
+# host's busybox and binaries).  Either way kexec loads the RUNNING kernel, so
+# only the userspace of the ramdisk is being replaced.
+RAMDISK_SOURCE=${VPS2KEXEC_RAMDISK_SOURCE:-debian}
+DI_MIRROR=${VPS2KEXEC_DI_MIRROR:-http://deb.debian.org/debian}
+DI_SUITE=${VPS2KEXEC_DI_SUITE:-stable}
+DI_ARCH=${VPS2KEXEC_DI_ARCH:-amd64}
+DI_DEB_INDEX=$WORKDIR/di-index-deb.txt
+DI_UDEB_INDEX=$WORKDIR/di-index-udeb.txt
+declare -A DI_PKG_FILE=()
+declare -A DI_PKG_DEP=()
+declare -A DI_PKG_DISTS=()
+declare -A DI_INDEX_PARSED=()
+RESOLVED_DEBS=()
+
+die() {
+	printf 'FATAL: %s\n' "$*" >&2
+	exit 1
+}
+
+warn() {
+	printf 'WARNING: %s\n' "$*" >&2
+}
+
+# sq renders a string as a single-quoted shell literal for safe interpolation
+# into the generated Combustion script, escaping embedded single quotes.
+sq() {
+	printf "'%s'" "${1//\'/\'\\\'\'}"
+}
+
+usage() {
+	cat <<EOF
+Usage: $PROGRAM [options]
+
+Boot the running kernel plus a small self-made initramfs with kexec, then
+deploy a raw image to the target disk from that initramfs.  The old kernel,
+systemd and filesystem are gone before the image is written.  By default the
+raw image is streamed over HTTP directly to the target disk, so it never has to
+fit in RAM.  The default action is a read-only plan; --execute requires an
+exact VPS2KEXEC_CONFIRM value.
+
+Options:
+  --image-url URL       Raw image URL (default: streamed to the target disk).
+                        A .squashfs URL cannot be streamed.
+  --image-file FILE     Local raw image or SquashFS file (used with embed mode)
+  --sha256 HASH         Expected SHA-256 of the raw image
+  --image-size BYTES    Expected raw image size; auto-detected from the HTTP
+                        Content-Length when omitted (stream mode)
+  --disk DEVICE         Target whole disk (default: disk containing /)
+  --hostname NAME       Hostname written by Combustion
+  --interface NAME      Source/default network interface
+  --ipv4 CIDR           Static IPv4 address, for example 10.0.0.20/24
+  --gateway ADDRESS     IPv4 gateway written by Combustion
+  --dns ADDRESS         DNS server(s), separated by commas or semicolons
+  --user NAME           Login user created by Combustion (default: root)
+  --password VALUE      Password for --user; when set, password SSH login is
+                        enabled as well as the SSH key
+  --ssh-key-file FILE   authorized_keys source (default: /root/.ssh/authorized_keys)
+  --root-size-gib N     Btrfs partition size (default: 64)
+  --config-size-mib N   Minimum Combustion partition size (default: 1024);
+                        the partition is extended to the end of the disk
+  --kernel FILE         Kernel image loaded with kexec (default: /boot/vmlinuz-\$(uname -r))
+  --ramdisk-source SRC  Where the deploy ramdisk userspace comes from:
+                        debian (default): fetch the Debian installer (d-i)
+                        netboot initrd plus the required .deb/.udeb packages
+                        over HTTP and assemble the ramdisk without the host
+                        package manager; host: stage the running host's
+                        busybox and binaries
+  --di-mirror URL       Debian mirror for the installer components
+                        (default: http://deb.debian.org/debian)
+  --di-suite NAME       Debian suite the installer components come from
+                        (default: stable)
+  --di-arch NAME        Debian architecture (default: amd64)
+  --image-mode MODE     auto (default), stream or embed.
+                        stream: fetch the raw image over HTTP into the disk;
+                        embed:  carry the image inside the initramfs (RAM-heavy)
+  --execute             Load the initramfs with kexec and switch kernels
+  --dry-run             Print the plan without staging or changing anything
+  --stage-test          Build the initramfs, syntax-check its scripts and
+                        kexec -l / kexec -u without switching kernels; this
+                        works under Secure Boot via kexec_file_load (-s)
+  -h, --help            Show this help
+
+Examples:
+  # Recommended: stream a raw image from HTTP (low RAM)
+  VPS2KEXEC_CONFIRM=WIPE:/dev/sda $PROGRAM --execute \\
+    --image-url http://10.68.247.224:18080/openSUSE-Leap-Micro.raw \\
+    --sha256 <raw-image-sha256> --disk /dev/sda \\
+    --hostname target --user leap --password '<password>' \\
+    --ipv4 192.0.2.20/24 --gateway 192.0.2.1 --dns 192.0.2.53
+
+  $PROGRAM --stage-test \\
+    --image-url http://10.68.247.224:18080/openSUSE-Leap-Micro.raw
+
+The configuration partition uses the Leap Micro Combustion contract:
+filesystem label "combustion" and /combustion/script. It is not a generic
+cloud-init disk; the script writes the user, password, hostname, networking
+and SSH keys.
+EOF
+}
+
+command_path() {
+	command -v "$1" 2>/dev/null || return 1
+}
+
+need_command() {
+	command_path "$1" >/dev/null || die "required command is missing: $1"
+}
+
+partition_path() {
+	case "$1" in
+		/dev/nvme*|/dev/mmcblk*|/dev/loop*) printf '%sp%s\n' "$1" "$2" ;;
+		*) printf '%s%s\n' "$1" "$2" ;;
+	esac
+}
+
+download_file() {
+	local url=$1 destination=$2
+	if command -v curl >/dev/null 2>&1; then
+		curl --fail --location --retry 3 --output "$destination" "$url"
+	elif command -v wget >/dev/null 2>&1; then
+		wget --tries=3 --output-document="$destination" "$url"
+	else
+		die 'curl or wget is required to download the image'
+	fi
+}
+
+# detect_image_size reads the expected raw image size from the HTTP
+# Content-Length header without downloading the body.
+detect_image_size() {
+	local url=$1 length
+	if command -v curl >/dev/null 2>&1; then
+		length=$(curl --fail --silent --show-error --head --location "$url" 2>/dev/null |
+			awk 'BEGIN { IGNORECASE = 1 } /^content-length:/ { gsub(/\r/, ""); print $2; exit }')
+	fi
+	if [[ -z "$length" ]] && command -v wget >/dev/null 2>&1; then
+		length=$(wget --spider --server-response "$url" 2>&1 |
+			awk 'BEGIN { IGNORECASE = 1 } /Content-Length:/ { gsub(/\r/, ""); print $2; exit }')
+	fi
+	printf '%s' "$length"
+}
+
+resolve_image_mode() {
+	case "$IMAGE_MODE_REQUEST" in
+		stream|embed)
+			IMAGE_MODE=$IMAGE_MODE_REQUEST
+			;;
+		auto|'')
+			if [[ -n "$IMAGE_URL" ]]; then
+				if [[ "$IMAGE_URL" == *.raw ]]; then
+					IMAGE_MODE=stream
+				else
+					die "cannot stream '$IMAGE_URL': only a raw image can be streamed; pass a raw .raw URL or use --image-mode embed (RAM-heavy)"
+				fi
+			elif [[ -n "$IMAGE_FILE" ]]; then
+				IMAGE_MODE=embed
+				warn 'streaming needs an HTTP raw URL; a local file must be embedded in the initramfs (RAM-heavy)'
+			else
+				die 'provide --image-url (raw, streamed) or --image-file'
+			fi
+			;;
+		*)
+			die "invalid --image-mode: $IMAGE_MODE_REQUEST (use auto, stream or embed)"
+			;;
+	esac
+}
+
+prepare_image() {
+	local archive raw_candidate extract
+	mkdir -p "$WORKDIR"
+
+	if [[ "$IMAGE_MODE" == stream ]]; then
+		[[ -n "$IMAGE_URL" ]] || die 'stream mode requires --image-url pointing to a raw image'
+		[[ "$IMAGE_URL" == *.raw ]] || die "cannot stream a non-raw URL: $IMAGE_URL"
+		IMAGE_RAW_URL=$IMAGE_URL
+		if [[ -z "$IMAGE_SIZE" ]]; then
+			printf 'Querying image size: %s\n' "$IMAGE_URL"
+			IMAGE_SIZE=$(detect_image_size "$IMAGE_URL")
+		fi
+		[[ "$IMAGE_SIZE" =~ ^[1-9][0-9]*$ ]] || \
+			die 'cannot determine the raw image size from Content-Length; pass --image-size'
+		RAW_SIZE=$IMAGE_SIZE
+		[[ -n "$IMAGE_SHA256" ]] || warn 'no --sha256 given; the streamed image will not be verified'
+		return 0
+	fi
+
+	# embed mode: materialise a raw file locally and carry it in the initramfs.
+	if [[ -n "$IMAGE_FILE" ]]; then
+		[[ -f "$IMAGE_FILE" ]] || die "image file does not exist: $IMAGE_FILE"
+		archive=$IMAGE_FILE
+	else
+		[[ -n "$IMAGE_URL" ]] || die 'provide --image-url or --image-file'
+		archive="$WORKDIR/image.download"
+		printf 'Downloading image: %s\n' "$IMAGE_URL"
+		download_file "$IMAGE_URL" "$archive"
+	fi
+
+	if [[ "$archive" == *.raw ]]; then
+		RAW_FILE="$WORKDIR/image.raw"
+		if [[ "$archive" != "$RAW_FILE" ]]; then
+			cp -f "$archive" "$RAW_FILE"
+		fi
+	else
+		need_command unsquashfs
+		extract="$WORKDIR/extracted"
+		rm -rf "$extract"
+		mkdir -p "$extract"
+		unsquashfs -f -d "$extract" "$archive" >/dev/null
+		raw_candidate=$(find "$extract" -type f -name '*.raw' -print -quit)
+		[[ -n "$raw_candidate" ]] || die 'the image archive does not contain a .raw image'
+		RAW_FILE="$WORKDIR/image.raw"
+		# Move instead of copy: the raw image is several GiB and the extracted
+		# tree is on the same filesystem.
+		rm -f "$RAW_FILE"
+		mv -f "$raw_candidate" "$RAW_FILE"
+	fi
+
+	[[ -s "$RAW_FILE" ]] || die 'the extracted raw image is empty'
+	RAW_SIZE=$(stat -c '%s' "$RAW_FILE")
+	if [[ -n "$IMAGE_SHA256" ]]; then
+		printf '%s  %s\n' "$IMAGE_SHA256" "$RAW_FILE" | sha256sum -c -
+	fi
+}
+
+discover_source() {
+	ROOT_SOURCE=$(findmnt -nro SOURCE /) || die 'cannot determine the current root source'
+	SOURCE_DISK=$(lsblk -sno PATH,TYPE "$ROOT_SOURCE" | awk '$2 == "disk" { print $1; exit }')
+	[[ -n "$SOURCE_DISK" ]] || die "cannot determine the disk containing $ROOT_SOURCE"
+	[[ -n "$TARGET_DISK" ]] || TARGET_DISK=$SOURCE_DISK
+	[[ "$(lsblk -dnro TYPE "$TARGET_DISK")" == disk ]] || die "$TARGET_DISK is not a whole disk"
+}
+
+# device_driver_modules prints the kernel module name of every driver in the
+# parent chain of a sysfs device node. The module name is read from the driver's
+# own module symlink, so it is the real module (sd -> sd_mod) rather than the
+# driver name, and drivers built into the kernel (no module symlink) are skipped
+# because the initramfs reuses the running kernel. The whole chain is captured
+# because a physical machine needs the leaf driver, the transport and the host
+# bus (for example sd_mod, virtio_scsi, virtio_pci), not only the first one.
+device_driver_modules() {
+	local node driver module
+	node=$(readlink -f "$1" 2>/dev/null) || return 0
+	while [[ -n "$node" && "$node" != / ]]; do
+		if [[ -L "$node/driver" ]]; then
+			driver=$(readlink -f "$node/driver")
+			if [[ -L "$driver/module" ]]; then
+				module=$(basename "$(readlink -f "$driver/module")")
+				[[ -n "$module" ]] && printf '%s\n' "$module"
+			fi
+		fi
+		node=$(dirname "$node")
+	done
+}
+
+# interface_device_node prints a sysfs device path for a network interface,
+# following bridge and bond masters down to the first member that has a device
+# node. A PVE vmbrX, a bond, or a stacked bridge has no /device of its own, so
+# without this the NIC driver would be missed on a physical host that bonds or
+# bridges its management interface.
+interface_device_node() {
+	local name=$1 member
+	while :; do
+		if [[ -e "/sys/class/net/$name/device" ]]; then
+			printf '%s\n' "/sys/class/net/$name/device"
+			return 0
+		fi
+		member=$(ip -o link show master "$name" 2>/dev/null | awk -F': |@' 'NR == 1 { print $2; exit }')
+		[[ -n "$member" ]] || return 1
+		name=$member
+	done
+}
+
+discover_configuration() {
+	local nameserver bridge_member altname
+	[[ -n "$TARGET_HOSTNAME" ]] || TARGET_HOSTNAME=$(hostname -s)
+	[[ -n "$TARGET_INTERFACE" ]] || TARGET_INTERFACE=$(ip -4 route show default | awk 'NR == 1 { print $5; exit }')
+	[[ -n "$TARGET_INTERFACE" ]] || die 'cannot determine the default network interface; set --interface'
+	# A PVE host's vmbrX is not a deployable interface. Resolve its physical
+	# bridge member first, then preserve the member name and all kernel altnames.
+	if [[ "$TARGET_INTERFACE" == vmbr* ]]; then
+		bridge_member=$(ip -o link show master "$TARGET_INTERFACE" | awk -F': |@' 'NR == 1 { print $2; exit }')
+		if [[ -n "$bridge_member" ]]; then
+			warn "mapping source bridge $TARGET_INTERFACE to target interface $bridge_member"
+			TARGET_INTERFACE=$bridge_member
+		else
+			warn "source bridge $TARGET_INTERFACE has no visible member; target will use fallback discovery"
+		fi
+	fi
+	[[ -n "$TARGET_INTERFACE_NAMES" ]] || TARGET_INTERFACE_NAMES=$TARGET_INTERFACE
+	while read -r altname; do
+		[[ -n "$altname" ]] || continue
+		case ",$TARGET_INTERFACE_NAMES," in
+			*,"$altname",*) ;;
+			*) TARGET_INTERFACE_NAMES="$TARGET_INTERFACE_NAMES,$altname" ;;
+		esac
+	done < <(ip -o link show dev "$TARGET_INTERFACE" | awk '{ for (i = 1; i <= NF; i++) if ($i == "altname") { name = $(i + 1); sub(/\\$/, "", name); print name } }')
+	if [[ -z "$TARGET_MAC" ]]; then
+		[[ -r "/sys/class/net/$TARGET_INTERFACE/address" ]] || die "cannot determine MAC address for $TARGET_INTERFACE"
+		TARGET_MAC=$(cat "/sys/class/net/$TARGET_INTERFACE/address")
+	fi
+	TARGET_MAC=$(printf '%s' "$TARGET_MAC" | tr '[:upper:]' '[:lower:]')
+	[[ -n "$TARGET_IPV4_CIDR" ]] || \
+		TARGET_IPV4_CIDR=$(ip -4 -o addr show dev "$TARGET_INTERFACE" scope global | awk 'NR == 1 { print $4; exit }')
+	[[ -n "$TARGET_IPV4_CIDR" ]] || die 'cannot determine the current IPv4 address; set --ipv4'
+	[[ -n "$TARGET_GATEWAY" ]] || \
+		TARGET_GATEWAY=$(ip -4 route show default dev "$TARGET_INTERFACE" | awk 'NR == 1 { print $3; exit }')
+	[[ -n "$TARGET_GATEWAY" ]] || die 'cannot determine the default gateway; set --gateway'
+	if [[ -z "$TARGET_DNS" ]]; then
+		nameserver=$(awk '/^nameserver[[:space:]]+/ { print $2 }' /etc/resolv.conf | paste -sd ';' -)
+		TARGET_DNS=$nameserver
+	fi
+	TARGET_DNS=${TARGET_DNS//,/;}
+	TARGET_DNS=${TARGET_DNS// /;}
+	[[ "$TARGET_DNS" == '' || "$TARGET_DNS" == *';' ]] || TARGET_DNS+=';'
+
+	# Capture the source NIC and storage driver modules so /init can modprobe
+	# them on a physical machine whose kernel ships them as modules. The whole
+	# driver chain is captured (virtio_net and virtio_pci; the storage leaf,
+	# transport and host bus) because a physical machine needs all of them.
+	if [[ -z "$TARGET_NIC_DRIVERS" ]]; then
+		if nic_node=$(interface_device_node "$TARGET_INTERFACE"); then
+			TARGET_NIC_DRIVERS=$(device_driver_modules "$nic_node" | sort -u | paste -sd ' ' -)
+		fi
+	fi
+	if [[ -z "$TARGET_DISK_DRIVERS" ]]; then
+		TARGET_DISK_DRIVERS=$(device_driver_modules "/sys/class/block/${TARGET_DISK##*/}/device" | sort -u | paste -sd ' ' -)
+	fi
+
+	[[ "$TARGET_HOSTNAME" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$ ]] || \
+		die "invalid target hostname: $TARGET_HOSTNAME"
+	[[ "$TARGET_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || \
+		die "invalid target user: $TARGET_USER"
+	[[ "$TARGET_PASSWORD" != *$'\n'* && "$TARGET_PASSWORD" != *$'\r'* ]] || \
+		die 'the target password may not contain a newline'
+	[[ "$TARGET_INTERFACE" =~ ^[A-Za-z0-9_.:-]+$ ]] || \
+		die "invalid target interface: $TARGET_INTERFACE"
+	[[ "$TARGET_INTERFACE_NAMES" =~ ^[A-Za-z0-9_.:-]+(,[A-Za-z0-9_.:-]+)*$ ]] || \
+		die "invalid target interface names: $TARGET_INTERFACE_NAMES"
+	[[ "$TARGET_MAC" =~ ^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$ ]] || \
+		die "invalid target MAC address: $TARGET_MAC"
+	[[ "$TARGET_IPV4_CIDR" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || \
+		die "invalid target IPv4 CIDR: $TARGET_IPV4_CIDR"
+	[[ "$TARGET_GATEWAY" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || \
+		die "invalid target gateway: $TARGET_GATEWAY"
+	[[ "$ROOT_SIZE_GIB" =~ ^[1-9][0-9]*$ ]] || die "invalid root size: $ROOT_SIZE_GIB GiB"
+	[[ "$CONFIG_SIZE_MIB" =~ ^[1-9][0-9]*$ ]] || die "invalid config size: $CONFIG_SIZE_MIB MiB"
+	[[ -s "$SSH_KEY_FILE" ]] || die "SSH authorized_keys file is missing or empty: $SSH_KEY_FILE"
+}
+
+detect_kernel() {
+	[[ -n "$KEXEC_KERNEL" ]] || KEXEC_KERNEL=/boot/vmlinuz-$(uname -r)
+	if [[ ! -r "$KEXEC_KERNEL" ]]; then
+		KEXEC_KERNEL=$(ls -1 /boot/vmlinuz-* 2>/dev/null | tail -n 1)
+	fi
+	[[ -n "$KEXEC_KERNEL" && -r "$KEXEC_KERNEL" ]] || die 'cannot find a kernel image; set --kernel'
+}
+
+check_kexec_support() {
+	local lockdown
+	if ! KEXEC_BIN=$(command_path kexec); then
+		KEXEC_BIN=
+		# The host-side kernel switch still needs a kexec binary.  Debian mode
+		# fetches kexec-tools over HTTP in ensure_host_kexec instead of using
+		# the host package manager; host mode requires it to be installed.
+		[[ "$RAMDISK_SOURCE" == debian ]] || die 'required command is missing: kexec'
+	fi
+	[[ -r /sys/kernel/security/lockdown ]] || return 0
+	lockdown=$(cat /sys/kernel/security/lockdown 2>/dev/null || true)
+	case "$lockdown" in
+		*'[integrity]'*|*'[confidentiality]'*)
+			# Lockdown only denies the legacy kexec_load syscall. The
+			# file-based kexec_file_load syscall is still allowed for a
+			# kernel image the firmware trusts (the running, signed kernel),
+			# so Secure Boot no longer has to be disabled.
+			warn "kernel lockdown is active ($lockdown); using kexec_file_load (-s) with the running signed kernel"
+			KEXEC_LOCKDOWN=1
+			;;
+	esac
+}
+
+print_plan() {
+	local size_bytes disk_bytes model
+	size_bytes=${RAW_SIZE:-0}
+	disk_bytes=$(blockdev --getsize64 "$TARGET_DISK")
+	model=$(lsblk -dnro MODEL "$TARGET_DISK" | sed 's/[[:space:]]*$//')
+	printf '%s\n' '=== VPS2KEXEC PLAN ==='
+	printf 'boot method:     kexec (%s)\n' "$KEXEC_KERNEL"
+	printf 'ramdisk source:  %s\n' "$(ramdisk_source_description)"
+	printf 'image mode:      %s\n' "$IMAGE_MODE"
+	printf 'source root:     %s (%s)\n' "$ROOT_SOURCE" "$(findmnt -nro FSTYPE /)"
+	printf 'source disk:     %s\n' "$SOURCE_DISK"
+	printf 'target disk:     %s (%s bytes, %s)\n' "$TARGET_DISK" "$disk_bytes" "${model:-unknown model}"
+	if [[ "$IMAGE_MODE" == stream ]]; then
+		printf 'image source:    %s (streamed to disk, %s bytes)\n' "$IMAGE_RAW_URL" "$size_bytes"
+	else
+		printf 'image source:    %s (embedded in initramfs, %s bytes)\n' "$RAW_FILE" "$size_bytes"
+	fi
+	printf 'image sha256:    %s\n' "${IMAGE_SHA256:-none (not verified)}"
+	printf 'target hostname: %s\n' "$TARGET_HOSTNAME"
+	printf 'target network:  %s (%s) names=%s %s via %s DNS %s\n' "$TARGET_INTERFACE" "$TARGET_MAC" "$TARGET_INTERFACE_NAMES" "$TARGET_IPV4_CIDR" "$TARGET_GATEWAY" "${TARGET_DNS:-none}"
+	printf 'root/config:     %s GiB Btrfs / Combustion to end of disk (min %s MiB)\n' "$ROOT_SIZE_GIB" "$CONFIG_SIZE_MIB"
+	printf 'SSH keys:        %s\n' "$SSH_KEY_FILE"
+	if [[ "$IMAGE_MODE" == embed ]]; then
+		printf 'raw partition table:\n'
+		sfdisk --dump "$RAW_FILE" 2>/dev/null || warn 'sfdisk could not print the raw image partition table'
+	else
+		printf '%s\n' 'The raw image GPT will be parsed from the target disk after streaming.'
+	fi
+	if [[ "$SOURCE_DISK" == "$TARGET_DISK" ]]; then
+		printf '%s\n' 'The target is the current system disk; kexec discards the old root before writing.'
+	else
+		printf '%s\n' 'The target is different from the current system disk.'
+	fi
+}
+
+check_dependencies() {
+	local command_name archive
+	for command_name in awk ar blockdev cp cpio find findmnt gzip lsblk mount readlink rm sha256sum sfdisk stat sync tar tr umount; do
+		need_command "$command_name"
+	done
+	for command_name in hostname ip modinfo modprobe mountpoint paste sort; do
+		need_command "$command_name"
+	done
+	if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+		die 'curl or wget is required to download over HTTP'
+	fi
+	# The host ramdisk source stages the running host's tools, so it needs them
+	# on the host.  The Debian source fetches every staged file over HTTP, so
+	# the host only needs the archive tooling above; kexec is prepared later by
+	# ensure_host_kexec and never through the host package manager.
+	if [[ "$RAMDISK_SOURCE" == host ]]; then
+		for command_name in busybox dropbearkey sgdisk; do
+			need_command "$command_name"
+		done
+	fi
+	# unsquashfs is only needed in embed mode when the source is an archive.
+	if [[ "$IMAGE_MODE" == embed ]]; then
+		archive=${IMAGE_FILE:-$IMAGE_URL}
+		if [[ "$archive" != *.raw ]]; then
+			need_command unsquashfs
+		fi
+	fi
+}
+
+# stage_binary_into copies an executable and every shared library it needs into
+# a filesystem tree rooted at $1, preserving absolute paths so the interpreter
+# and rpath references keep working inside the initramfs.
+stage_binary_into() {
+	local root=$1 source=$2 real dependency dependency_real
+	real=$(readlink -f "$source")
+	[[ -x "$real" ]] || die "cannot stage executable: $source"
+	mkdir -p "$root$(dirname "$source")" "$root$(dirname "$real")"
+	# Resolve Debian alternatives/symlink entry points inside the initramfs;
+	# copying the absolute symlink alone would point back at the source root.
+	cp -aL "$source" "$root$source"
+	cp -a "$real" "$root$real"
+	while read -r dependency; do
+		[[ -z "$dependency" || "$dependency" == linux-vdso* ]] && continue
+		[[ -e "$dependency" || -L "$dependency" ]] || continue
+		mkdir -p "$root$(dirname "$dependency")"
+		cp -aL "$dependency" "$root$dependency"
+		dependency_real=$(readlink -f "$dependency")
+		if [[ -e "$dependency_real" ]]; then
+			mkdir -p "$root$(dirname "$dependency_real")"
+			cp -a "$dependency_real" "$root$dependency_real"
+		fi
+	done < <(ldd "$real" 2>/dev/null | awk '/=> \/[^ ]+/ { print $3 } /^[[:space:]]*\/[^ ]+/ { print $1 }')
+}
+
+# module_names_to_stage lists every module the running (physical) machine has
+# in use, plus the drivers and filesystems the deploy initramfs always needs.
+# The running system is the target machine, so its in-use modules are exactly
+# the drivers the kexec initramfs must load again.
+module_names_to_stage() {
+	{
+		lsmod | awk 'NR > 1 { print $1 }'
+		printf '%s\n' ${TARGET_NIC_DRIVERS:-} ${TARGET_DISK_DRIVERS:-} \
+			loop ext4 vfat btrfs sd_mod scsi_mod
+	} | awk 'NF' | sort -u
+}
+
+# stage_kernel_modules copies the .ko files for the in-use modules (with their
+# full dependency closure) and the modprobe metadata into the initramfs, so the
+# same kernel can bring the target hardware up after kexec on a physical host.
+stage_kernel_modules() {
+	local kver mod ko file modules_dir
+	kver=$(uname -r)
+	modules_dir=/lib/modules/$kver
+	[[ -d "$modules_dir" ]] || { warn "no $modules_dir; not staging kernel modules"; return 0; }
+	mkdir -p "$STAGE$modules_dir"
+	declare -A seen=()
+	while read -r mod; do
+		[[ -n "$mod" ]] || continue
+		while read -r ko; do
+			[[ -n "$ko" && -f "$ko" ]] || continue
+			[[ -n "${seen[$ko]:-}" ]] && continue
+			seen[$ko]=1
+			mkdir -p "$STAGE$(dirname "$ko")"
+			cp -a "$ko" "$STAGE$ko"
+		done < <(modprobe --show-depends "$mod" 2>/dev/null | awk '/^insmod / { print $2 }')
+	done < <(module_names_to_stage)
+	for file in modules.dep modules.dep.bin modules.alias modules.alias.bin \
+		modules.softdep modules.builtin modules.builtin.bin modules.symbols modules.symbols.bin; do
+		[[ -f "$modules_dir/$file" ]] || continue
+		cp -a "$modules_dir/$file" "$STAGE$modules_dir/$file"
+	done
+}
+
+# stage_firmware copies any firmware blobs the in-use modules request; some
+# physical NICs and storage controllers need them before they initialise.
+stage_firmware() {
+	local mod fw candidate
+	while read -r mod; do
+		[[ -n "$mod" ]] || continue
+		while read -r fw; do
+			[[ -n "$fw" ]] || continue
+			for candidate in "/lib/firmware/updates/$fw" "/lib/firmware/$fw" \
+				"/lib/firmware/updates/$(uname -r)/$fw" "/lib/firmware/$(uname -r)/$fw"; do
+				[[ -f "$candidate" ]] || continue
+				mkdir -p "$STAGE$(dirname "$candidate")"
+				cp -a "$candidate" "$STAGE$candidate"
+			done
+		done < <(modinfo -F firmware "$mod" 2>/dev/null)
+	done < <(module_names_to_stage)
+}
+
+write_init() {
+	cat > "$STAGE/init" <<'INIT'
+#!/usr/bin/bash
+set -u
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+export PATH
+/bin/busybox --install -s /bin 2>/dev/null || true
+
+log() {
+	printf '[vps2kexec] %s\n' "$*"
+	printf '[vps2kexec] %s\n' "$*" > /dev/kmsg 2>/dev/null || true
+}
+
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || mount -t tmpfs tmpfs /dev 2>/dev/null || true
+mkdir -p /dev/pts /tmp /run /config /root/.ssh
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+
+# PID1 must never exit: if it does (for example on an unbound variable), the
+# kernel panics with "Attempted to kill init". Divert stderr to the kernel log
+# so userspace errors reach the serial console, and trap EXIT into rescue().
+exec 2>/dev/kmsg
+# Debug: trace every command into the kernel log (visible on the serial console).
+exec 8>/dev/kmsg
+BASH_XTRACEFD=8
+PS4='+${LINENO}: '
+export PS4
+set -x
+
+# efivarfs is built into the running kernel; mount it so efibootmgr can create
+# the firmware boot entry from inside the initramfs.
+if [ -d /sys/firmware/efi ]; then
+	mkdir -p /sys/firmware/efi/efivars
+	mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null || \
+		log 'WARNING: cannot mount efivarfs; the EFI boot entry may be skipped'
+fi
+
+. /deploy.env
+
+start_dropbear() {
+	if [ -z "${DROPBEAR_BIN:-}" ] || [ ! -x "$DROPBEAR_BIN" ]; then
+		log 'WARNING: dropbear is missing; SSH rescue is unavailable'
+		return 0
+	fi
+	if [ -n "${DROPBEAR_KEY:-}" ]; then
+		"$DROPBEAR_BIN" -s -r "$DROPBEAR_KEY" -p 22 -P /run/dropbear.pid >/dev/null 2>&1 || \
+			log 'WARNING: dropbear failed to start'
+	else
+		"$DROPBEAR_BIN" -s -p 22 -P /run/dropbear.pid >/dev/null 2>&1 || \
+			log 'WARNING: dropbear failed to start'
+	fi
+}
+
+# bring_up_network matches the target NIC by MAC, because inside a bare
+# initramfs there is no udev to apply the predictable interface names.
+bring_up_network() {
+	local path name address
+	NET_IFACE=
+	for path in /sys/class/net/*; do
+		[ -r "$path/address" ] || continue
+		name=${path##*/}
+		[ "$name" = lo ] && continue
+		address=$(tr 'A-Z' 'a-z' < "$path/address")
+		if [ -n "${TARGET_MAC:-}" ] && [ "$address" = "$TARGET_MAC" ]; then
+			NET_IFACE=$name
+			break
+		fi
+		if [ -z "${NET_IFACE:-}" ]; then
+			NET_IFACE=$name
+		fi
+	done
+	if [ -z "${NET_IFACE:-}" ]; then
+		log 'ERROR: no usable network interface found'
+		return 1
+	fi
+	ip link set dev "$NET_IFACE" up 2>/dev/null || true
+	if [ -n "${TARGET_IPV4_CIDR:-}" ]; then
+		ip addr add "$TARGET_IPV4_CIDR" dev "$NET_IFACE" 2>/dev/null || true
+	fi
+	if [ -n "${TARGET_GATEWAY:-}" ]; then
+		ip route add default via "$TARGET_GATEWAY" dev "$NET_IFACE" 2>/dev/null || true
+	fi
+	if [ -n "${TARGET_DNS:-}" ]; then
+		printf 'nameserver %s\n' "$(printf '%s' "$TARGET_DNS" | tr ';' ' ')" > /etc/resolv.conf
+	fi
+	log "network up on $NET_IFACE (${TARGET_IPV4_CIDR:-no address})"
+}
+
+verify_image() {
+	if [ -z "${IMAGE_SIZE:-}" ] || [ -z "${IMAGE_SHA256:-}" ]; then
+		log 'WARNING: image size or checksum missing; skipping verification'
+		return 0
+	fi
+	log "verifying $IMAGE_SIZE bytes read back from $DISK"
+	local actual
+	if [ $((IMAGE_SIZE % 1048576)) -eq 0 ]; then
+		actual=$(dd if="$DISK" bs=1M count=$((IMAGE_SIZE / 1048576)) 2>/dev/null | sha256sum | awk '{print $1}')
+	else
+		actual=$(head -c "$IMAGE_SIZE" "$DISK" | sha256sum | awk '{print $1}')
+	fi
+	log "image sha256 read back: $actual"
+	if [ "$actual" != "$IMAGE_SHA256" ]; then
+		log "ERROR: image checksum mismatch (expected $IMAGE_SHA256)"
+		return 1
+	fi
+	log 'image checksum verified'
+}
+
+# write_image streams the raw image straight to the disk (no RAM buffer) or, in
+# embed mode, copies the image carried inside this initramfs. It never buffers
+# the whole image in memory: the HTTP stream is piped into dd, so at most a few
+# megabytes are in flight. Page cache grows while streaming but is reclaimable
+# kernel memory, not an anonymous buffer holding the image.
+write_image() {
+	local wget_rc dd_rc
+	if [ "${IMAGE_MODE:-stream}" = embed ]; then
+		[ -s /image.raw ] || { log 'ERROR: embedded image is missing'; return 1; }
+		log 'writing embedded image to disk'
+		if ! dd if=/image.raw of="$DISK" bs=4M; then
+			return 1
+		fi
+	else
+		[ -n "${IMAGE_RAW_URL:-}" ] || { log 'ERROR: no image URL for streaming'; return 1; }
+		log "streaming image to $DISK: $IMAGE_RAW_URL"
+		# A watchdog so a stalled HTTP GET cannot wedge the box; when it fires,
+		# dd sees EOF and write_image fails into the rescue path (SSH stays up).
+		timeout 1800 wget -O - "$IMAGE_RAW_URL" | dd of="$DISK" bs=4M
+		# Save PIPESTATUS in one step: any assignment resets PIPESTATUS, so
+		# reading it twice (${PIPESTATUS[0]} then ${PIPESTATUS[1]}) would make
+		# the second read unbound under set -u.
+		pipe_status=("${PIPESTATUS[@]}")
+		wget_rc=${pipe_status[0]}
+		dd_rc=${pipe_status[1]}
+		if [ "$wget_rc" -ne 0 ] || [ "$dd_rc" -ne 0 ]; then
+			log "ERROR: streaming failed (wget=$wget_rc dd=$dd_rc)"
+			return 1
+		fi
+	fi
+	sync
+	verify_image
+}
+
+rescue() {
+	log 'RESCUE: automatic deploy did not finish; staying alive'
+	log 'RESCUE: SSH (dropbear, root pubkey) is available on port 22'
+	log 'RESCUE: a console shell is attached below as well'
+	for tty in /dev/tty0 /dev/ttyS0; do
+		[ -e "$tty" ] || continue
+		setsid sh -i <"$tty" >"$tty" 2>&1 &
+	done
+	while :; do
+		if [ -f /run/dropbear.pid ] && kill -0 "$(cat /run/dropbear.pid)" 2>/dev/null; then
+			:
+		else
+			start_dropbear
+		fi
+		sleep 30
+	done
+}
+
+trap 'printf "[vps2kexec] init exiting rc=%s\n" "$?" > /dev/kmsg 2>/dev/null; rescue' EXIT
+log "kexec initramfs is up, kernel $(uname -r)"
+log "target disk ${DISK:-unknown}, image mode ${IMAGE_MODE:-stream}"
+
+# Load the drivers the running hardware used, so kexec brings up the network and
+# storage on a physical machine whose kernel ships them as modules. On a kernel
+# that builds them in, these calls are harmless no-ops.
+load_required_modules() {
+	local mod
+	# Coldplug through busybox mdev (in place of the udev a bare initramfs does
+	# not have): the modalias rule lets the kernel autoload present devices.
+	if command -v mdev >/dev/null 2>&1; then
+		printf '%s\n' '$MODALIAS=.* 0:0 0660 @modprobe $MODALIAS' > /etc/mdev.conf
+		mdev -s 2>/dev/null || true
+	fi
+	for mod in loop ext4 vfat sd_mod scsi_mod ${TARGET_DISK_DRIVERS:-} ${TARGET_NIC_DRIVERS:-}; do
+		[ -n "$mod" ] || continue
+		modprobe "$mod" 2>/dev/null && log "loaded module $mod" || true
+	done
+}
+load_required_modules
+
+bring_up_network || log 'WARNING: network bring-up failed; streaming may fail'
+start_dropbear
+
+# Log MemAvailable periodically so the streaming run can be shown not to hold
+# the image in RAM. Kernel-page-cache writes are reclaimable; a real buffer
+# would show MemAvailable collapsing.
+(
+	while :; do
+		awk '/MemAvailable/ { printf "[vps2kexec] MemAvailable=%s kB\n", $2 }' /proc/meminfo > /dev/kmsg 2>/dev/null || true
+		sleep 20
+	done
+) &
+
+if write_image; then
+	log 'running deployer'
+	if /usr/bin/bash /deploy "$DISK" >/dev/kmsg 2>&1; then
+		log 'deployer returned 0 without rebooting; entering rescue'
+	else
+		log "deployer failed with status $?; entering rescue"
+	fi
+else
+	log 'image write or verification failed; entering rescue'
+fi
+rescue
+INIT
+	chmod 0755 "$STAGE/init"
+}
+
+write_deploy() {
+	cat > "$STAGE/deploy" <<'DEPLOY'
+#!/usr/bin/bash
+set -Eeuo pipefail
+
+DISK=${1:?target disk is required}
+. /deploy.env
+
+AUTHORIZED_KEYS=$(cat /authorized_keys)
+
+fail() {
+	printf 'FATAL: %s\n' "$*" >&2
+	printf 'FATAL: %s\n' "$*" > /dev/kmsg 2>/dev/null || true
+	exit 1
+}
+
+flush_disk() {
+	sync
+	blockdev --flushbufs "$DISK" || fail "cannot flush pending writes for $DISK"
+}
+
+printf '%s\n' '=== VPS2KEXEC INITRAMFS DEPLOYMENT ==='
+[[ "$(lsblk -dnro TYPE "$DISK")" == disk ]] || fail "not a whole disk: $DISK"
+flush_disk
+
+for node in $(lsblk -nrpo NAME,TYPE "$DISK" | awk '$2 == "part" { print $1 }'); do
+	[[ -z "$(findmnt -rn -S "$node" || true)" ]] || fail "target partition is still mounted: $node"
+done
+
+# The raw image was streamed (or embedded then written) to the disk by /init.
+# Parse its GPT from the disk itself: there is no local raw file to read.
+SECTOR_SIZE=$(sfdisk --dump "$DISK" 2>/dev/null | awk '/^sector-size:/ { print $2; exit }')
+DISK_SECTORS=$(blockdev --getsz "$DISK")
+RAW_TABLE=$(sfdisk --dump "$DISK" 2>/dev/null)
+RAW_DISK_GUID=$(printf '%s\n' "$RAW_TABLE" | awk '/^label-id:/ { print $2; exit }')
+RAW_P1_LINE=$(printf '%s\n' "$RAW_TABLE" | awk -v part="${DISK}1" '$1 == part { print; exit }')
+RAW_P2_LINE=$(printf '%s\n' "$RAW_TABLE" | awk -v part="${DISK}2" '$1 == part { print; exit }')
+RAW_P3_LINE=$(printf '%s\n' "$RAW_TABLE" | awk -v part="${DISK}3" '$1 == part { print; exit }')
+table_field() {
+	local line=$1 key=$2 value
+	# sfdisk pads values after the '=' (for example "start=     2048,"), so the
+	# value is not necessarily part of the same whitespace-separated field.
+	value=$(printf '%s\n' "$line" | awk -v key="$key" '{
+		if (match($0, key "= *[^, ]+")) {
+			value = substr($0, RSTART, RLENGTH)
+			sub("^" key "= *", "", value)
+			gsub(/,/, "", value)
+			print value
+			exit
+		}
+	}')
+	printf '%s\n' "$value"
+}
+RAW_P1_START=$(table_field "$RAW_P1_LINE" start)
+RAW_P1_SIZE=$(table_field "$RAW_P1_LINE" size)
+RAW_P1_TYPE=$(table_field "$RAW_P1_LINE" type)
+RAW_P1_UUID=$(table_field "$RAW_P1_LINE" uuid)
+RAW_P2_START=$(table_field "$RAW_P2_LINE" start)
+RAW_P2_SIZE=$(table_field "$RAW_P2_LINE" size)
+RAW_P2_TYPE=$(table_field "$RAW_P2_LINE" type)
+RAW_P2_UUID=$(table_field "$RAW_P2_LINE" uuid)
+RAW_ROOT_START=$(table_field "$RAW_P3_LINE" start)
+RAW_P3_TYPE=$(table_field "$RAW_P3_LINE" type)
+RAW_P3_UUID=$(table_field "$RAW_P3_LINE" uuid)
+[[ "$SECTOR_SIZE" =~ ^[0-9]+$ && "$RAW_ROOT_START" =~ ^[0-9]+$ ]] || fail 'cannot calculate the Combustion partition offset'
+[[ -n "$RAW_DISK_GUID" && -n "$RAW_P1_START" && -n "$RAW_P1_SIZE" && -n "$RAW_P1_TYPE" && -n "$RAW_P1_UUID" && \
+	-n "$RAW_P2_START" && -n "$RAW_P2_SIZE" && -n "$RAW_P2_TYPE" && -n "$RAW_P2_UUID" && \
+	-n "$RAW_P3_TYPE" && -n "$RAW_P3_UUID" ]] || fail 'cannot read the raw image GPT metadata from the disk'
+ROOT_SIZE_SECTORS=$((ROOT_SIZE_GIB * 1024 * 1024 * 1024 / SECTOR_SIZE))
+ALIGN_SECTORS=$((1048576 / SECTOR_SIZE))
+CONFIG_START=$((RAW_ROOT_START + ROOT_SIZE_SECTORS))
+CONFIG_START=$(((CONFIG_START + ALIGN_SECTORS - 1) / ALIGN_SECTORS * ALIGN_SECTORS))
+	# openSUSE Leap Micro and other KIWI SelfInstall images grow the root
+	# partition to fill any unpartitioned space on the first boot and recreate
+	# kiwi_RootPart immediately after the last partition.  That would move our
+	# root partition and orphan the root filesystem.  Extend the Combustion
+	# partition to the end of the disk so no free space remains and the image's
+	# first-boot repartitioning is skipped.
+	CONFIG_SIZE=$((DISK_SECTORS - 34 - CONFIG_START))
+	(( CONFIG_SIZE >= CONFIG_SIZE_MIB * 1024 * 1024 / SECTOR_SIZE )) || \
+		fail 'not enough free space for the Combustion partition'
+	CONFIG_END=$((CONFIG_START + CONFIG_SIZE - 1))
+# The kernel partition devices scanned at boot describe the old PVE layout.
+# The image was just written, so remove any stale mapping before sgdisk.
+partx -d "$DISK" 2>/dev/null || true
+sgdisk --zap-all "$DISK"
+sgdisk \
+	--disk-guid="$RAW_DISK_GUID" \
+	--new=1:"$RAW_P1_START":"$((RAW_P1_START + RAW_P1_SIZE - 1))" \
+	--typecode=1:"$RAW_P1_TYPE" --partition-guid=1:"$RAW_P1_UUID" --change-name=1:p.legacy \
+	--new=2:"$RAW_P2_START":"$((RAW_P2_START + RAW_P2_SIZE - 1))" \
+	--typecode=2:"$RAW_P2_TYPE" --partition-guid=2:"$RAW_P2_UUID" --change-name=2:p.UEFI \
+	--new=3:"$RAW_ROOT_START":"$((RAW_ROOT_START + ROOT_SIZE_SECTORS - 1))" \
+	--typecode=3:"$RAW_P3_TYPE" --partition-guid=3:"$RAW_P3_UUID" --change-name=3:p.lxroot \
+	--new=4:"$CONFIG_START":"$CONFIG_END" \
+	--typecode=4:0FC63DAF-8483-4772-8E79-3D69D8477DE4 --change-name=4:combustion \
+	"$DISK"
+sync
+sgdisk --verify "$DISK" || fail "the target GPT failed verification: $DISK"
+ACTUAL_ROOT=$(sfdisk --dump "$DISK" | awk -v part="${DISK}3" '$1 == part { gsub(/,/, "", $4); gsub(/,/, "", $6); print $4 " " $6; exit }')
+[[ "$ACTUAL_ROOT" == "$RAW_ROOT_START $ROOT_SIZE_SECTORS" ]] || \
+	fail "target GPT root partition mismatch: expected $RAW_ROOT_START/$ROOT_SIZE_SECTORS, got ${ACTUAL_ROOT:-missing}"
+# Assert the Combustion partition exists and no >10 MiB hole is left: openSUSE
+# Leap Micro's first boot (55kiwi-repart) relocates kiwi_RootPart and drops
+# this partition whenever more than ~10 MiB of unpartitioned space is free.
+ACTUAL_CONFIG=$(sfdisk --dump "$DISK" | awk -v part="${DISK}4" '$1 == part { print $1 }')
+[[ -n "$ACTUAL_CONFIG" ]] || fail 'the Combustion partition was not created'
+LAST_USABLE=$((DISK_SECTORS - 34))
+FREE_SECTORS=$((LAST_USABLE - CONFIG_END))
+(( FREE_SECTORS * SECTOR_SIZE < 10 * 1024 * 1024 )) || \
+	fail "target disk still has ${FREE_SECTORS} free sectors; Leap Micro would repartition it"
+
+CONFIG_OFFSET=$((CONFIG_START * SECTOR_SIZE))
+CONFIG_BYTES=$((CONFIG_SIZE * SECTOR_SIZE))
+CONFIG_LOOP=$(losetup --find --show --offset "$CONFIG_OFFSET" --sizelimit "$CONFIG_BYTES" "$DISK") || \
+	fail 'cannot create a loop device for the Combustion partition'
+cleanup_config() {
+	umount /config 2>/dev/null || true
+	losetup -d "$CONFIG_LOOP" 2>/dev/null || true
+}
+trap cleanup_config EXIT
+mke2fs -F -t ext4 -L combustion "$CONFIG_LOOP"
+mkdir -p /config
+mount "$CONFIG_LOOP" /config
+mkdir -p /config/combustion
+
+# sshd policy: password authentication is enabled only when a password was
+# requested, and root password login only when the requested user is root.
+SSHD_PASSWORD_AUTH=no
+SSHD_ROOT_LOGIN=prohibit-password
+if [[ -n "$TARGET_PASSWORD" ]]; then
+	SSHD_PASSWORD_AUTH=yes
+	[[ "$TARGET_USER" != root ]] || SSHD_ROOT_LOGIN=yes
+fi
+
+cat > /config/combustion/script <<COMBUSTION
+#!/bin/bash
+set -euxo pipefail
+
+if [[ -d /sysroot/etc ]]; then
+	ROOT=/sysroot
+else
+	ROOT=/
+fi
+echo '$TARGET_HOSTNAME' > "\$ROOT/etc/hostname"
+
+mkdir -p "\$ROOT/etc/NetworkManager/system-connections"
+cat > "\$ROOT/etc/NetworkManager/system-connections/vps2kexec.nmconnection" <<'NETWORK'
+[connection]
+id=vps2kexec
+type=ethernet
+autoconnect=true
+
+[802-3-ethernet]
+mac-address=$TARGET_MAC
+
+[ipv4]
+method=manual
+address1=$TARGET_IPV4_CIDR,$TARGET_GATEWAY
+dns=$TARGET_DNS
+
+[ipv6]
+method=disabled
+NETWORK
+
+	# Prefer the saved bridge member MAC. If the target kernel exposes a
+	# different predictable name, NetworkManager can still match the device by
+	# MAC. If that fails, use the saved member/altnames, then the first UP NIC.
+	TARGET_INTERFACE_NAMES='$TARGET_INTERFACE_NAMES'
+	TARGET_MAC='$TARGET_MAC'
+	find_by_mac() {
+		local path name address
+		for path in /sys/class/net/*; do
+			[[ -r "\$path/address" ]] || continue
+			name=\${path##*/}
+			[[ "\$name" == lo ]] && continue
+			address=\$(tr '[:upper:]' '[:lower:]' < "\$path/address")
+			if [[ "\$address" == "\$TARGET_MAC" ]]; then
+				printf '%s\n' "\$name"
+				return 0
+			fi
+		done
+		return 1
+	}
+	find_by_name() {
+		local candidate old_ifs=\$IFS
+		IFS=,
+		for candidate in \$TARGET_INTERFACE_NAMES; do
+			if [[ -d "/sys/class/net/\$candidate" && "\$candidate" != lo ]]; then
+				printf '%s\n' "\$candidate"
+				IFS=\$old_ifs
+				return 0
+			fi
+		done
+		IFS=\$old_ifs
+		return 1
+	}
+	find_first_up() {
+		local path name state
+		for path in /sys/class/net/*; do
+			[[ -r "\$path/operstate" ]] || continue
+			name=\${path##*/}
+			[[ "\$name" == lo ]] && continue
+			state=\$(cat "\$path/operstate" 2>/dev/null || true)
+			if [[ "\$state" == up ]]; then
+				printf '%s\n' "\$name"
+				return 0
+			fi
+		done
+		return 1
+	}
+	SELECTED_INTERFACE=\$(find_by_mac || true)
+	NETWORK_MATCH=mac
+	if [[ -z "\$SELECTED_INTERFACE" ]]; then
+		SELECTED_INTERFACE=\$(find_by_name || true)
+		NETWORK_MATCH=name
+	fi
+	if [[ -z "\$SELECTED_INTERFACE" ]]; then
+		SELECTED_INTERFACE=\$(find_first_up || true)
+		NETWORK_MATCH=name
+	fi
+	{
+		printf '%s\n' '[connection]' 'id=vps2kexec' 'type=ethernet' 'autoconnect=true'
+		if [[ "\$NETWORK_MATCH" == mac ]]; then
+			printf 'mac-address=%s\n' "\$TARGET_MAC"
+		elif [[ -n "\$SELECTED_INTERFACE" ]]; then
+			printf 'interface-name=%s\n' "\$SELECTED_INTERFACE"
+		fi
+		printf '%s\n' '' '[ipv4]'
+		printf 'method=manual\naddress1=%s,%s\ndns=%s\n' '$TARGET_IPV4_CIDR' '$TARGET_GATEWAY' '$TARGET_DNS'
+		printf '%s\n' '' '[ipv6]' 'method=disabled'
+	} > "\$ROOT/etc/NetworkManager/system-connections/vps2kexec.nmconnection"
+	chmod 600 "\$ROOT/etc/NetworkManager/system-connections/vps2kexec.nmconnection"
+
+mkdir -p "\$ROOT/root/.ssh"
+cat > "\$ROOT/root/.ssh/authorized_keys" <<'SSHKEYS'
+$AUTHORIZED_KEYS
+SSHKEYS
+chmod 700 "\$ROOT/root/.ssh"
+chmod 600 "\$ROOT/root/.ssh/authorized_keys"
+
+# Provision the requested login user, its password and its SSH key. Leap
+# Micro's Combustion chroots into the target root before running this script
+# (so ROOT is usually /); when a /sysroot layout is used instead, run the
+# account tools through chroot so they still act on the target.
+TARGET_USER='$TARGET_USER'
+TARGET_PASSWORD='$TARGET_PASSWORD'
+run_in_target() {
+	if [[ "\$ROOT" == / ]]; then
+		"\$@"
+	else
+		chroot "\$ROOT" "\$@"
+	fi
+}
+ensure_user() {
+	local user=\$TARGET_USER home uid_gid
+	if [[ "\$user" != root ]] && ! grep -q "^\$user:" "\$ROOT/etc/passwd"; then
+		run_in_target /usr/sbin/useradd -m -s /bin/bash "\$user" || \
+			run_in_target /usr/sbin/useradd -m "\$user"
+	fi
+	if [[ -n "\$TARGET_PASSWORD" ]]; then
+		printf '%s:%s\n' "\$user" "\$TARGET_PASSWORD" | run_in_target /usr/sbin/chpasswd
+	fi
+	home=\$(awk -F: -v u="\$user" '\$1==u{print \$6}' "\$ROOT/etc/passwd")
+	[[ -n "\$home" ]] || home=/root
+	uid_gid=\$(awk -F: -v u="\$user" '\$1==u{print \$3":"\$4}' "\$ROOT/etc/passwd")
+	mkdir -p "\$ROOT\$home/.ssh"
+	cat > "\$ROOT\$home/.ssh/authorized_keys" <<'USERKEYS'
+$AUTHORIZED_KEYS
+USERKEYS
+	chmod 700 "\$ROOT\$home/.ssh"
+	chmod 600 "\$ROOT\$home/.ssh/authorized_keys"
+	if [[ -n "\$uid_gid" ]]; then
+		chown -R "\$uid_gid" "\$ROOT\$home/.ssh"
+	fi
+	# /home is a separate btrfs subvolume on Leap Micro and is NOT part of a
+	# transactional-update snapshot, so a key written under the user home here
+	# is shadowed on the first real boot. /etc IS captured by the snapshot, so
+	# also install the key under /etc/ssh/authorized_keys.d and let sshd read it
+	# (AuthorizedKeysFile drop-in below); a firstboot unit recreates the real
+	# ~/.ssh on the /home subvolume.
+	mkdir -p "\$ROOT/etc/ssh/authorized_keys.d"
+	cat > "\$ROOT/etc/ssh/authorized_keys.d/\$user" <<'USERKEYS'
+$AUTHORIZED_KEYS
+USERKEYS
+	chmod 644 "\$ROOT/etc/ssh/authorized_keys.d/\$user"
+	chown root:root "\$ROOT/etc/ssh/authorized_keys.d/\$user"
+	chmod 755 "\$ROOT/etc/ssh/authorized_keys.d"
+}
+ensure_user
+
+# The user home lives on the /home subvolume, which Combustion cannot write
+# (see above). Materialize ~/.ssh there on the first real boot from the copy
+# under /etc, so the requested user ends up with a working authorized_keys.
+if [[ '$TARGET_USER' != root ]]; then
+	mkdir -p "\$ROOT/etc/systemd/system"
+	cat > "\$ROOT/etc/systemd/system/vps2kexec-user-home.service" <<UNIT
+[Unit]
+Description=Create home and SSH authorized_keys for $TARGET_USER
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/install -d -m 0700 -o $TARGET_USER -g $TARGET_USER /home/$TARGET_USER/.ssh
+ExecStart=/usr/bin/install -m 0600 -o $TARGET_USER -g $TARGET_USER /etc/ssh/authorized_keys.d/$TARGET_USER /home/$TARGET_USER/.ssh/authorized_keys
+ExecStart=/usr/bin/chown -R $TARGET_USER:$TARGET_USER /home/$TARGET_USER
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+	systemctl --root="\$ROOT" enable vps2kexec-user-home.service
+fi
+
+mkdir -p "\$ROOT/etc/ssh/sshd_config.d"
+cat > "\$ROOT/etc/ssh/sshd_config.d/90-vps2kexec.conf" <<SSHD
+PermitRootLogin $SSHD_ROOT_LOGIN
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys /etc/ssh/authorized_keys.d/%u
+PasswordAuthentication $SSHD_PASSWORD_AUTH
+SSHD
+
+# Add the created user to wheel and let the group run sudo with the caller's
+# own password. openSUSE ships `Defaults targetpw`, so a plain `%wheel` rule
+# would still ask for ROOT's password; override it for the group.
+if [[ '$TARGET_USER' != root ]]; then
+	run_in_target usermod -aG wheel '$TARGET_USER' 2>/dev/null || \
+		run_in_target gpasswd -a '$TARGET_USER' wheel 2>/dev/null || true
+	if [[ -e "\$ROOT/usr/etc/sudoers" || -e "\$ROOT/etc/sudoers" ]]; then
+		mkdir -p "\$ROOT/etc/sudoers.d"
+		cat > "\$ROOT/etc/sudoers.d/wheel" <<'SUDOERS'
+Defaults:%wheel !targetpw
+%wheel ALL=(ALL:ALL) ALL
+SUDOERS
+		chmod 0440 "\$ROOT/etc/sudoers.d/wheel"
+		chown root:root "\$ROOT/etc/sudoers.d/wheel"
+	fi
+fi
+
+systemctl --root="\$ROOT" enable sshd.service
+systemctl --root="\$ROOT" enable NetworkManager.service
+
+# Grow the root filesystem to fill its partition. The deployer normally does
+# this before the first boot; this is a fallback for a source host without
+# btrfs-progs. It is idempotent (a no-op once the filesystem fills the
+# partition).
+if command -v btrfs >/dev/null 2>&1; then
+	btrfs filesystem resize max "\$ROOT" 2>/dev/null || true
+fi
+
+# Mirror kernel and systemd output to the VGA console in addition to the serial
+# console, so the boot is visible on the PVE web console even when the serial
+# console is not attached. The image already carries console=tty0 in
+# GRUB_CMDLINE_LINUX_DEFAULT, but its generated grub.cfg omitted it; patch the
+# effective grub.cfg directly and update the bootloader defaults so later
+# grub2-mkconfig runs keep the setting. Effective from the next boot.
+if [[ -f "\$ROOT/boot/grub2/grub.cfg" ]] && ! grep -q 'console=tty0' "\$ROOT/boot/grub2/grub.cfg"; then
+	sed -i 's/console=ttyS0,115200/console=ttyS0,115200 console=tty0/g' "\$ROOT/boot/grub2/grub.cfg"
+fi
+if [[ -f "\$ROOT/etc/default/grub" ]] && ! grep -q 'console=tty0' "\$ROOT/etc/default/grub"; then
+	sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 console=tty0"/' "\$ROOT/etc/default/grub"
+fi
+if [[ -f "\$ROOT/etc/sysconfig/bootloader" ]] && ! grep -q 'console=tty0' "\$ROOT/etc/sysconfig/bootloader"; then
+	sed -i 's/^\(DEFAULT_APPEND="[^"]*\)"/\1 console=tty0"/; s/^\(FAILSAFE_APPEND="[^"]*\)"/\1 console=tty0"/' "\$ROOT/etc/sysconfig/bootloader"
+fi
+COMBUSTION
+chmod 0700 /config/combustion/script
+sync
+umount /config
+losetup -d "$CONFIG_LOOP"
+trap - EXIT
+
+# Refresh the kernel partition table to the freshly written GPT before
+# efibootmgr resolves partition 2, and create an explicit NVRAM entry.
+partx -u "$DISK" 2>/dev/null || true
+blockdev --rereadpt "$DISK" 2>/dev/null || true
+
+# Grow the image's root filesystem to fill the (larger) root partition before
+# the first boot. Filling the disk with the Combustion partition suppresses the
+# image's own growroot / kiwi-repart first-boot resize, so grow it here or the
+# root stays at its small image size (a few GiB) inside a large partition.
+# btrfs resize needs a mounted path, so mount the partition briefly; the
+# Combustion script also grows it as a fallback if this cannot run.
+ROOT_PART=$DISK
+case "$DISK" in
+	/dev/nvme*|/dev/mmcblk*|/dev/loop*) ROOT_PART="${DISK}p3" ;;
+	*) ROOT_PART="${DISK}3" ;;
+esac
+if [[ -b "$ROOT_PART" ]] && command -v btrfs >/dev/null 2>&1; then
+	modprobe btrfs 2>/dev/null || true
+	mkdir -p /mnt/root
+	if mount -o rw "$ROOT_PART" /mnt/root 2>/dev/null; then
+		if btrfs filesystem resize max /mnt/root; then
+			printf 'Grew the root filesystem on %s to fill the partition\n' "$ROOT_PART"
+		else
+			printf 'WARNING: could not grow the root filesystem on %s\n' "$ROOT_PART" >&2
+		fi
+		umount /mnt/root 2>/dev/null || true
+	else
+		printf 'WARNING: could not mount %s to grow the root filesystem\n' "$ROOT_PART" >&2
+	fi
+else
+	printf 'WARNING: btrfs is unavailable; the root filesystem was not grown here\n' >&2
+fi
+
+if [[ -d /sys/firmware/efi ]]; then
+	command -v efibootmgr >/dev/null 2>&1 || fail 'UEFI boot detected but efibootmgr is not staged'
+	efibootmgr -c -d "$DISK" -p 2 -L 'vps2kexec' -l '\EFI\BOOT\BOOTX64.EFI' || \
+		fail 'efibootmgr could not create the vps2kexec boot entry'
+	efibootmgr -v || fail 'efibootmgr could not read the new boot entry'
+else
+	printf '%s\n' 'UEFI runtime unavailable; relying on the EFI fallback path or BIOS boot code.'
+fi
+	flush_disk
+	printf '%s\n' 'Raw image written. Rebooting into the new system.'
+reboot -f
+DEPLOY
+	chmod 0755 "$STAGE/deploy"
+}
+
+build_initramfs() {
+	case "$RAMDISK_SOURCE" in
+		host) build_initramfs_host ;;
+		debian) build_initramfs_debian ;;
+		*) die "invalid --ramdisk-source: $RAMDISK_SOURCE (use host or debian)" ;;
+	esac
+}
+
+ramdisk_source_description() {
+	if [[ "$RAMDISK_SOURCE" == debian ]]; then
+		printf 'Debian installer (d-i) components (%s %s/%s, assembled without the host package manager)' \
+			"$DI_MIRROR" "$DI_SUITE" "$DI_ARCH"
+	else
+		printf 'host system tools (busybox + staged host binaries and libraries)'
+	fi
+}
+
+di_url() {
+	printf '%s/dists/%s/%s\n' "$DI_MIRROR" "$DI_SUITE" "$1"
+}
+
+# fetch_debian_index downloads and caches a Debian Packages index: the ordinary
+# .deb archive or the debian-installer .udeb archive for the target suite/arch.
+fetch_debian_index() {
+	local dist=$1 rel destination url
+	case "$dist" in
+		deb) rel="main/binary-$DI_ARCH/Packages.gz"; destination=$DI_DEB_INDEX ;;
+		udeb) rel="main/debian-installer/binary-$DI_ARCH/Packages.gz"; destination=$DI_UDEB_INDEX ;;
+		*) die "internal error: unknown Debian index '$dist'" ;;
+	esac
+	[[ -s "$destination" ]] && return 0
+	url=$(di_url "$rel")
+	printf 'Fetching Debian %s index: %s\n' "$dist" "$url"
+	download_file "$url" "$destination.download"
+	gzip -dc "$destination.download" > "$destination"
+	rm -f "$destination.download"
+	[[ -s "$destination" ]] || die "the Debian $dist index is empty: $url"
+}
+
+# di_parse_index turns a Packages index into the lookup tables used by the
+# resolver: package name -> Filename and package name -> Depends/Pre-Depends.
+# Debian field continuation lines (which start with a space) are ignored, which
+# is safe because in practice only Description/Tag wrap.
+di_parse_index() {
+	local dist=$1 file=$2 name filename dependencies key
+	[[ -n "${DI_INDEX_PARSED[$dist]:-}" ]] && return 0
+	DI_INDEX_PARSED[$dist]=1
+	while IFS=$'\t' read -r name filename dependencies; do
+		[[ -n "$name" && -n "$filename" ]] || continue
+		key=$dist/$name
+		DI_PKG_FILE[$key]=$filename
+		DI_PKG_DEP[$key]=$dependencies
+		DI_PKG_DISTS[$name]="${DI_PKG_DISTS[$name]:-}${DI_PKG_DISTS[$name]:+ }$dist"
+	done < <(awk -v dist="$dist" '
+		/^Package: /{ name=substr($0,10) }
+		/^Filename: /{ filename=substr($0,11) }
+		/^Depends: /{ dependencies=dependencies (dependencies?" ":"") substr($0,10) }
+		/^Pre-Depends: /{ dependencies=dependencies (dependencies?" ":"") substr($0,13) }
+		/^$/{ if(name!=""){ print name "\t" filename "\t" dependencies } name="";filename="";dependencies="" }
+		END{ if(name!=""){ print name "\t" filename "\t" dependencies } }
+	' "$file")
+}
+
+load_debian_indexes() {
+	fetch_debian_index deb
+	fetch_debian_index udeb
+	di_parse_index deb "$DI_DEB_INDEX"
+	di_parse_index udeb "$DI_UDEB_INDEX"
+}
+
+# resolve_debian_packages walks the dependency graph of the requested packages,
+# following shared-library dependencies (names starting with "lib") recursively
+# so the assembled initramfs has a complete runtime closure.  The result is the
+# global RESOLVED_DEBS array of "dist filename" entries.
+resolve_debian_packages() {
+	local -a queue=("$@")
+	local name key dist dependency depspec old_ifs
+	local -A resolved=()
+	RESOLVED_DEBS=()
+	while ((${#queue[@]})); do
+		name=${queue[0]}
+		queue=("${queue[@]:1}")
+		[[ -n "$name" ]] || continue
+		[[ -n "${resolved[$name]:-}" ]] && continue
+		resolved[$name]=1
+		if [[ -z "${DI_PKG_DISTS[$name]:-}" ]]; then
+			warn "Debian package not found in $DI_SUITE/$DI_ARCH: $name"
+			continue
+		fi
+		for dist in ${DI_PKG_DISTS[$name]}; do
+			key=$dist/$name
+			RESOLVED_DEBS+=("$dist ${DI_PKG_FILE[$key]}")
+			depspec=${DI_PKG_DEP[$key]:-}
+			old_ifs=$IFS
+			IFS=,
+			for dependency in $depspec; do
+				dependency=${dependency%%|*}
+				dependency=${dependency#"${dependency%%[![:space:]]*}"}
+				dependency=${dependency%% *}
+				dependency=${dependency%%:*}
+				[[ -n "$dependency" ]] || continue
+				[[ "$dependency" == lib* ]] || continue
+				queue+=("$dependency")
+			done
+			IFS=$old_ifs
+		done
+	done
+}
+
+# extract_package_into unpacks the data.tar member of a .deb/.udeb into the tree
+# rooted at $2.  Only the archive tooling (ar + tar with the right decompressor)
+# is needed, never the host package manager.
+extract_package_into() {
+	local archive=$1 destination=$2 member
+	member=$(ar t "$archive" | awk '/^data\.tar/{ print; exit }')
+	[[ -n "$member" ]] || die "no data.tar member in $archive"
+	case "$member" in
+		*.tar.xz) ar p "$archive" "$member" | tar --no-same-owner -xJ -C "$destination" ;;
+		*.tar.zst) ar p "$archive" "$member" | tar --no-same-owner --zstd -x -C "$destination" ;;
+		*.tar.gz) ar p "$archive" "$member" | tar --no-same-owner -xz -C "$destination" ;;
+		*.tar.bz2) ar p "$archive" "$member" | tar --no-same-owner -xj -C "$destination" ;;
+		*.tar) ar p "$archive" "$member" | tar --no-same-owner -x -C "$destination" ;;
+		*) die "unknown data.tar compression in $archive ($member)" ;;
+	esac
+}
+
+stage_debian_packages() {
+	local entry dist filename destination url
+	for entry in "${RESOLVED_DEBS[@]}"; do
+		dist=${entry%% *}
+		filename=${entry#* }
+		destination="$WORKDIR/debs/$(basename "$filename")"
+		if [[ ! -s "$destination" ]]; then
+			url="$DI_MIRROR/$filename"
+			printf 'Downloading Debian %s package: %s\n' "$dist" "$url"
+			download_file "$url" "$destination"
+		fi
+		extract_package_into "$destination" "$STAGE"
+	done
+}
+
+unpack_debian_initrd() {
+	local archive=$WORKDIR/debian-initrd.gz url
+	if [[ ! -s "$archive" ]]; then
+		url=$(di_url "main/installer-$DI_ARCH/current/images/netboot/debian-installer/$DI_ARCH/initrd.gz")
+		printf 'Fetching Debian installer initrd: %s\n' "$url"
+		download_file "$url" "$archive"
+	fi
+	rm -rf "$STAGE"
+	mkdir -p "$STAGE"
+	( cd "$STAGE" && gzip -dc "$archive" | cpio -i -d -m --no-absolute-filenames ) || \
+		die 'cannot unpack the Debian installer initrd'
+}
+
+# ensure_host_kexec makes a kexec binary available for the host-side kexec step.
+# It prefers the host's own kexec and otherwise extracts kexec-tools (with its
+# dependency closure, including kexec-tools' libxen* libraries) into $WORKDIR so
+# no host package manager is involved.  The extracted library directories are
+# added to LD_LIBRARY_PATH for the kexec calls.
+ensure_host_kexec() {
+	local entry dist filename destination kexec_path libdirs
+	[[ -n "$KEXEC_BIN" ]] && return 0
+	if KEXEC_BIN=$(command_path kexec); then
+		return 0
+	fi
+	[[ "$RAMDISK_SOURCE" == debian ]] || die 'kexec is required on the host'
+	printf '%s\n' 'kexec is not installed on the host; fetching Debian kexec-tools for the kexec step'
+	mkdir -p "$WORKDIR/debs" "$WORKDIR/hostbin"
+	load_debian_indexes
+	resolve_debian_packages kexec-tools
+	for entry in "${RESOLVED_DEBS[@]}"; do
+		dist=${entry%% *}
+		filename=${entry#* }
+		destination="$WORKDIR/debs/$(basename "$filename")"
+		if [[ ! -s "$destination" ]]; then
+			printf 'Downloading Debian %s package: %s\n' "$dist" "$DI_MIRROR/$filename"
+			download_file "$DI_MIRROR/$filename" "$destination"
+		fi
+		extract_package_into "$destination" "$WORKDIR/hostbin"
+	done
+	kexec_path=$(find "$WORKDIR/hostbin" -type f -name kexec -perm -u+x 2>/dev/null | head -n1)
+	[[ -n "$kexec_path" ]] || die 'the Debian kexec-tools package did not provide a kexec binary'
+	libdirs=$(find "$WORKDIR/hostbin" -type d -name '*-linux-gnu' 2>/dev/null | paste -sd: -)
+	LD_LIBRARY_PATH="${libdirs}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+	export LD_LIBRARY_PATH
+	KEXEC_BIN=$kexec_path
+	printf 'Using kexec binary: %s\n' "$KEXEC_BIN"
+}
+
+build_initramfs_debian() {
+	local dropbear_path
+	printf 'Ramdisk source: %s\n' "$(ramdisk_source_description)"
+	rm -rf "$STAGE"
+	mkdir -p "$WORKDIR/debs"
+	unpack_debian_initrd
+	load_debian_indexes
+	# Base tools that turn the Debian installer initrd into the deploy ramdisk.
+	# util-linux gives lsblk/findmnt/partx/blockdev/blkid; the separate mount
+	# package gives losetup (Debian 13 moved it out of util-linux); coreutils
+	# gives timeout/setsid/sync/sha256sum; gdisk gives sgdisk; efibootmgr gives
+	# efibootmgr; iproute2 gives ip; kmod gives modprobe/modinfo; dropbear-bin
+	# gives dropbear (SSH rescue); bash is the /init interpreter; zlib1g is the
+	# one non-"lib"-named runtime dependency (dropbear and btrfs link it).
+	# The udebs give sfdisk (fdisk-udeb), mke2fs (e2fsprogs-udeb) and btrfs
+	# (btrfs-progs-udeb).  Shared-library dependencies are resolved recursively.
+	resolve_debian_packages \
+		util-linux coreutils mount bash libtinfo6 zlib1g gdisk efibootmgr \
+		kexec-tools kmod iproute2 dropbear-bin \
+		fdisk-udeb e2fsprogs-udeb btrfs-progs-udeb
+	stage_debian_packages
+	# Documentation and translations dominate the size of a full .deb
+	# extraction and no deploy tool reads them, so drop them to keep the
+	# initramfs small enough for kexec_file_load.
+	rm -rf "$STAGE/usr/share/doc" "$STAGE/usr/share/man" "$STAGE/usr/share/info" \
+		"$STAGE/usr/share/locale" "$STAGE/usr/share/bash-completion" \
+		"$STAGE/usr/share/doc-base" "$STAGE/usr/share/gettext" \
+		"$STAGE/usr/share/lintian" "$STAGE/usr/share/bug"
+	# The Debian installer ships busybox at /usr/bin/busybox; /init expects it at
+	# /bin/busybox.  The d-i busybox has no mdev applet, which /init tolerates.
+	mkdir -p "$STAGE/bin"
+	ln -sf /usr/bin/busybox "$STAGE/bin/busybox"
+	# dropbear self-generates a host key at start when none is supplied, so no
+	# host-side dropbearkey is needed in Debian mode.
+	dropbear_path=$(find "$STAGE/usr/sbin" "$STAGE/usr/bin" "$STAGE/sbin" "$STAGE/bin" \
+		-maxdepth 1 -type f -name dropbear 2>/dev/null | head -n1)
+	if [[ -n "$dropbear_path" ]]; then
+		DROPBEAR_BIN=${dropbear_path#"$STAGE"}
+	else
+		DROPBEAR_BIN=
+		warn 'dropbear was not found in the Debian packages; SSH rescue will be unavailable'
+	fi
+	DROPBEAR_KEY=
+	rm -f "$STAGE/init" "$STAGE/deploy"
+	finalize_initramfs
+}
+
+build_initramfs_host() {
+	local command_name command_file
+	rm -rf "$STAGE"
+	mkdir -p "$STAGE"/{bin,sbin,usr/bin,usr/sbin,lib,lib64,proc,sys,dev,tmp,run,config,etc/dropbear,root/.ssh}
+
+	# Static busybox provides the shell applets (sh, wget, dd, head, sha256sum,
+	# ip, blockdev, setsid, ...) and keeps the initramfs small.
+	cp -L "$(command_path busybox)" "$STAGE/bin/busybox"
+	[[ -x "$STAGE/bin/busybox" ]] || die 'busybox is not executable'
+
+	for command_name in bash blkid dd dropbear efibootmgr findmnt losetup lsblk mke2fs partx sfdisk sgdisk; do
+		command_file=$(command_path "$command_name")
+		[[ -n "$command_file" ]] || die "cannot stage command into the initramfs: $command_name"
+		stage_binary_into "$STAGE" "$command_file"
+	done
+	# btrfs-progs grows the image's root filesystem to fill its partition; it is
+	# optional so the deploy still works on a source without btrfs-progs (the
+	# Combustion script grows the filesystem as a fallback).
+	if command_file=$(command_path btrfs); then
+		stage_binary_into "$STAGE" "$command_file"
+	else
+		warn 'btrfs is not installed on the source; the root filesystem will be grown by the target instead'
+	fi
+	DROPBEAR_BIN=$(command_path dropbear)
+	DROPBEAR_KEY=
+	finalize_initramfs
+}
+
+# finalize_initramfs adds the parts common to both ramdisk sources: the in-use
+# kernel modules and firmware, the account files, the deploy scripts and the
+# environment, then packs everything into a gzip cpio initramfs.
+finalize_initramfs() {
+	mkdir -p "$STAGE"/{proc,sys,dev,tmp,run,config,etc/dropbear,root/.ssh}
+
+	# The kernel modules still come from the host's /lib/modules/$(uname -r):
+	# kexec loads the RUNNING kernel, so ONLY modules built for that exact
+	# kernel are valid.  This is the one unavoidable host dependency of the
+	# Debian ramdisk source; it is not something the d-i components can replace.
+	stage_kernel_modules
+	stage_firmware
+
+	# Minimal account/database files so dropbear can resolve root and exec a shell.
+	printf 'root:x:0:0:root:/root:/bin/sh\n' > "$STAGE/etc/passwd"
+	printf 'root:x:0:\n' > "$STAGE/etc/group"
+	printf '/bin/sh\n/bin/bash\n' > "$STAGE/etc/shells"
+	printf 'passwd: files\ngroup: files\n' > "$STAGE/etc/nsswitch.conf"
+
+	# In host mode a throwaway dropbear host key is generated on the source host.
+	# In Debian mode dropbear generates its own key at start (no host dropbearkey).
+	if [[ "$RAMDISK_SOURCE" == host ]]; then
+		if dropbearkey -t ed25519 -f "$STAGE/etc/dropbear/dropbear_ed25519_host_key" >/dev/null 2>&1; then
+			DROPBEAR_KEY=/etc/dropbear/dropbear_ed25519_host_key
+		elif dropbearkey -t rsa -s 2048 -f "$STAGE/etc/dropbear/dropbear_rsa_host_key" >/dev/null 2>&1; then
+			DROPBEAR_KEY=/etc/dropbear/dropbear_rsa_host_key
+		else
+			die 'dropbearkey could not generate a host key'
+		fi
+		chmod 600 "$STAGE/etc/dropbear/"* 2>/dev/null || true
+	fi
+
+	cp -aL "$SSH_KEY_FILE" "$STAGE/authorized_keys"
+	cp -aL "$SSH_KEY_FILE" "$STAGE/root/.ssh/authorized_keys"
+	chmod 600 "$STAGE/root/.ssh/authorized_keys"
+
+	# embed mode carries the raw image; stream mode does not (the whole point).
+	if [[ "$IMAGE_MODE" == embed ]]; then
+		if [[ "$(stat -c %d "$RAW_FILE")" == "$(stat -c %d "$STAGE")" ]]; then
+			ln -f "$RAW_FILE" "$STAGE/image.raw"
+		else
+			cp -a "$RAW_FILE" "$STAGE/image.raw"
+		fi
+	fi
+
+	{
+		printf 'DISK=%q\n' "$TARGET_DISK"
+		printf 'IMAGE_MODE=%q\n' "$IMAGE_MODE"
+		printf 'IMAGE_RAW_URL=%q\n' "$IMAGE_RAW_URL"
+		printf 'IMAGE_SHA256=%q\n' "$IMAGE_SHA256"
+		printf 'IMAGE_SIZE=%q\n' "$IMAGE_SIZE"
+		printf 'DROPBEAR_BIN=%q\n' "$DROPBEAR_BIN"
+		printf 'DROPBEAR_KEY=%q\n' "$DROPBEAR_KEY"
+		printf 'TARGET_HOSTNAME=%q\n' "$TARGET_HOSTNAME"
+		printf 'TARGET_INTERFACE=%q\n' "$TARGET_INTERFACE"
+		printf 'TARGET_INTERFACE_NAMES=%q\n' "$TARGET_INTERFACE_NAMES"
+		printf 'TARGET_MAC=%q\n' "$TARGET_MAC"
+		printf 'TARGET_IPV4_CIDR=%q\n' "$TARGET_IPV4_CIDR"
+		printf 'TARGET_GATEWAY=%q\n' "$TARGET_GATEWAY"
+		printf 'TARGET_DNS=%q\n' "$TARGET_DNS"
+		printf 'TARGET_USER=%q\n' "$TARGET_USER"
+		printf 'TARGET_PASSWORD=%q\n' "$TARGET_PASSWORD"
+		printf 'TARGET_NIC_DRIVERS=%q\n' "$TARGET_NIC_DRIVERS"
+		printf 'TARGET_DISK_DRIVERS=%q\n' "$TARGET_DISK_DRIVERS"
+		printf 'ROOT_SIZE_GIB=%q\n' "$ROOT_SIZE_GIB"
+		printf 'CONFIG_SIZE_MIB=%q\n' "$CONFIG_SIZE_MIB"
+	} > "$STAGE/deploy.env"
+
+	write_init
+	write_deploy
+	/usr/bin/bash -n "$STAGE/init"
+	/usr/bin/bash -n "$STAGE/deploy"
+
+	printf 'Building initramfs: %s\n' "$INITRAMFS"
+	( cd "$STAGE" && find . -print0 | cpio -0 -o -H newc 2>/dev/null ) | gzip -6 > "$INITRAMFS"
+	[[ -s "$INITRAMFS" ]] || die 'the initramfs archive is empty'
+	rm -rf "$STAGE"
+}
+
+# load_kexec_image loads the running kernel plus the generated initramfs into the
+# kexec slot. Under UEFI Secure Boot the kernel is locked down and only
+# kexec_file_load (-s) is permitted, and only for a kernel image the firmware
+# already trusts -- the running, signed kernel that booted under Secure Boot.
+# kexec_load (-c) is kept as a fallback for a host without lockdown, where the
+# legacy syscall is still allowed.
+load_kexec_image() {
+	local command_line=$1
+	printf 'Loading kernel with kexec_file_load (-s): %s\n' "$KEXEC_KERNEL"
+	if "$KEXEC_BIN" -s -l "$KEXEC_KERNEL" --initrd="$INITRAMFS" --command-line="$command_line"; then
+		KEXEC_METHOD=file
+		return 0
+	fi
+	if (( KEXEC_LOCKDOWN )); then
+		die 'kexec_file_load (-s) was rejected while lockdown is active; the running kernel was not accepted as a trusted image'
+	fi
+	printf '%s\n' 'kexec_file_load (-s) failed; falling back to kexec_load (-c)'
+	"$KEXEC_BIN" -c -l "$KEXEC_KERNEL" --initrd="$INITRAMFS" --command-line="$command_line" || \
+		die 'kexec could not load the kernel with either kexec_file_load (-s) or kexec_load (-c)'
+	KEXEC_METHOD=legacy
+}
+
+# unload_kexec_image clears whatever load_kexec_image put in the kexec slot,
+# preferring the syscall that actually loaded it.
+unload_kexec_image() {
+	if [[ "$KEXEC_METHOD" == legacy ]]; then
+		"$KEXEC_BIN" -c -u 2>/dev/null || "$KEXEC_BIN" -u
+	else
+		"$KEXEC_BIN" -s -u 2>/dev/null || "$KEXEC_BIN" -u
+	fi
+}
+
+run_kexec() {
+	local command_line
+	command_line="console=ttyS0,115200 console=tty0 panic=120 vps2kexec.disk=$TARGET_DISK"
+	load_kexec_image "$command_line"
+	printf '%s\n' 'Switching kernels with kexec -e; the old kernel and systemd are discarded now.'
+	sync
+	"$KEXEC_BIN" -e
+}
+
+parse_args() {
+	EXECUTE=0
+	STAGE_TEST=0
+	while (($#)); do
+		case $1 in
+			--image-url) IMAGE_URL=${2:?missing value for --image-url}; shift 2 ;;
+			--image-file) IMAGE_FILE=${2:?missing value for --image-file}; shift 2 ;;
+			--image-raw-url) IMAGE_URL=${2:?missing value for --image-raw-url}; shift 2 ;;
+			--sha256) IMAGE_SHA256=${2:?missing value for --sha256}; shift 2 ;;
+			--image-size) IMAGE_SIZE=${2:?missing value for --image-size}; shift 2 ;;
+			--disk) TARGET_DISK=${2:?missing value for --disk}; shift 2 ;;
+			--hostname) TARGET_HOSTNAME=${2:?missing value for --hostname}; shift 2 ;;
+			--interface) TARGET_INTERFACE=${2:?missing value for --interface}; shift 2 ;;
+			--ipv4) TARGET_IPV4_CIDR=${2:?missing value for --ipv4}; shift 2 ;;
+			--gateway) TARGET_GATEWAY=${2:?missing value for --gateway}; shift 2 ;;
+			--dns) TARGET_DNS=${2:?missing value for --dns}; shift 2 ;;
+			--user) TARGET_USER=${2:?missing value for --user}; shift 2 ;;
+			--password) TARGET_PASSWORD=${2:?missing value for --password}; shift 2 ;;
+			--ssh-key-file) SSH_KEY_FILE=${2:?missing value for --ssh-key-file}; shift 2 ;;
+			--root-size-gib) ROOT_SIZE_GIB=${2:?missing value for --root-size-gib}; shift 2 ;;
+			--config-size-mib) CONFIG_SIZE_MIB=${2:?missing value for --config-size-mib}; shift 2 ;;
+			--kernel) KEXEC_KERNEL=${2:?missing value for --kernel}; shift 2 ;;
+			--ramdisk-source) RAMDISK_SOURCE=${2:?missing value for --ramdisk-source}; shift 2 ;;
+			--di-mirror) DI_MIRROR=${2:?missing value for --di-mirror}; shift 2 ;;
+			--di-suite) DI_SUITE=${2:?missing value for --di-suite}; shift 2 ;;
+			--di-arch) DI_ARCH=${2:?missing value for --di-arch}; shift 2 ;;
+			--image-mode) IMAGE_MODE_REQUEST=${2:?missing value for --image-mode}; shift 2 ;;
+			--execute) EXECUTE=1; shift ;;
+			--dry-run) EXECUTE=0; shift ;;
+			--stage-test) EXECUTE=0; STAGE_TEST=1; shift ;;
+			-h|--help) usage; exit 0 ;;
+			*) die "unknown option: $1" ;;
+		esac
+	done
+}
+
+main() {
+	parse_args "$@"
+	[[ $EUID -eq 0 ]] || die 'run as root'
+	case "$RAMDISK_SOURCE" in
+		host|debian) ;;
+		*) die "invalid --ramdisk-source: $RAMDISK_SOURCE (use host or debian)" ;;
+	esac
+	resolve_image_mode
+	check_dependencies
+	check_kexec_support
+	discover_source
+	discover_configuration
+	detect_kernel
+	prepare_image
+	print_plan
+
+	if (( STAGE_TEST )); then
+		ensure_host_kexec
+		build_initramfs
+		printf 'STAGE-TEST: initramfs is %s bytes\n' "$(stat -c '%s' "$INITRAMFS")"
+		load_kexec_image "console=ttyS0,115200 console=tty0 panic=120 vps2kexec.disk=$TARGET_DISK"
+		unload_kexec_image
+		printf '%s\n' "STAGE-TEST: initramfs scripts syntax-checked and kexec load/unload succeeded (method=$KEXEC_METHOD); no kernel switch and no disk change."
+		[[ "${VPS2KEXEC_KEEP_INITRAMFS:-0}" == 1 ]] || rm -f "$INITRAMFS"
+		return 0
+	fi
+
+	if (( ! EXECUTE )); then
+		printf '%s\n' 'DRY-RUN: no disk, mount, kexec, or reboot operation was performed.'
+		return 0
+	fi
+	[[ "${VPS2KEXEC_CONFIRM:-}" == "WIPE:$TARGET_DISK" ]] || \
+		die "set VPS2KEXEC_CONFIRM=WIPE:$TARGET_DISK to allow the destructive operation"
+	[[ "$SOURCE_DISK" == "$TARGET_DISK" ]] || warn 'target is not the current root disk; verify it before continuing'
+	ensure_host_kexec
+	build_initramfs
+	run_kexec
+}
+
+main "$@"
