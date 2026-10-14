@@ -60,9 +60,9 @@ VPS2LINUX_CONFIRM=WIPE:/dev/sda \
 
 当前版本的执行路径已经在 VM 600 上验证：PVE `ext4+LVM` 可以从 RAM bootstrap 覆盖为 Leap Micro `EFI+Btrfs`，并通过 `efibootmgr` 创建 `vps2linux` 启动项；Combustion 首启已验证静态 IP 和 SSH 公钥登录。VM 602 的 PVE `Btrfs` root 也已完成端到端验证（400 GiB 目标盘、root 100 GiB、Combustion 填满剩余空间），首启后 hostname、静态 IPv4、SSH 公钥均由 Combustion 生效。
 
-## vps2kexec（kexec + 自制 initramfs，方案 2）
+## vps2leapmicro（kexec + 自制 initramfs，方案 2）
 
-`vps2kexec` 是独立的部署入口：在运行中的 Linux 源主机上构建一个最小 initramfs，用 `kexec` 切换到新内核，再由 initramfs 的 PID1 写入 raw image。与 `vps2linux` 的 `pivot_root` 不同，旧内核、旧 systemd 和旧 Btrfs 在 `kexec -e` 后完全消失，旧 root 的 async discard / writeback 不再可能覆盖刚写入的目标盘。
+`vps2leapmicro` 是独立的部署入口：在运行中的 Linux 源主机上构建一个最小 initramfs，用 `kexec` 切换到新内核，再由 initramfs 的 PID1 写入 raw image。与 `vps2linux` 的 `pivot_root` 不同，旧内核、旧 systemd 和旧 Btrfs 在 `kexec -e` 后完全消失，旧 root 的 async discard / writeback 不再可能覆盖刚写入的目标盘。
 
 要求：
 
@@ -75,11 +75,11 @@ VPS2LINUX_CONFIRM=WIPE:/dev/sda \
 
 Combustion 的 `/combustion/script` 会配置登录用户名、密码、SSH key、hostname、静态 IPv4/网关/DNS，并启用 `sshd` 和 `NetworkManager`。用户名通过 `--user` 指定（默认 `root`），密码通过 `--password` 指定（可选，设置后同时开启公钥和密码登录）。
 
-与 `vps2linux` 相同：默认只生成只读计划；破坏性执行必须同时提供 `--execute` 和环境变量 `VPS2KEXEC_CONFIRM=WIPE:<disk>`。`--stage-test` 只构建 initramfs 并 `kexec -l` 装载再卸载，不切换内核。
+与 `vps2linux` 相同：默认只生成只读计划；破坏性执行必须同时提供 `--execute` 和环境变量 `VPS2LEAPMICRO_CONFIRM=WIPE:<disk>`。`--stage-test` 只构建 initramfs 并 `kexec -l` 装载再卸载，不切换内核。
 
 ```bash
-VPS2KEXEC_CONFIRM=WIPE:/dev/sda \
-  ./vps2kexec --execute \
+VPS2LEAPMICRO_CONFIRM=WIPE:/dev/sda \
+  ./vps2leapmicro --execute \
   --image-url 'http://10.68.247.224:18080/openSUSE-Leap-Micro.raw' \
   --sha256 "$RAW_IMAGE_SHA256" \
   --disk /dev/sda \
@@ -93,7 +93,7 @@ VPS2KEXEC_CONFIRM=WIPE:/dev/sda \
   --root-size-gib 40
 ```
 
-执行路径已在 VM 600 上端到端验证：`kexec -e` 后 initramfs 流式写入 image、重建 GPT 并创建直达磁盘末尾的 Combustion 分区（不留未分配空间，使 KIWI 首启跳过重分区），重启后由 `efibootmgr` 的 `vps2kexec` 启动项引导 Leap Micro；Combustion 首启生效（hostname、用户名/密码、静态 IP、`authorized_keys`），且首启后 Combustion 分区仍然存在、Btrfs 无损坏。
+执行路径已在 VM 600 上端到端验证：`kexec -e` 后 initramfs 流式写入 image、重建 GPT 并创建直达磁盘末尾的 Combustion 分区（不留未分配空间，使 KIWI 首启跳过重分区），重启后由 `efibootmgr` 的 `vps2leapmicro` 启动项引导 Leap Micro；Combustion 首启生效（hostname、用户名/密码、静态 IP、`authorized_keys`），且首启后 Combustion 分区仍然存在、Btrfs 无损坏。
 
 ## 安全边界
 
