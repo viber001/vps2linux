@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# vps2linux - replace a running Linux installation with a raw Linux image.
+# vps2img-pivot - replace a running Linux installation with a raw Linux image.
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
 # The destructive part is deliberately split into a RAM-backed bootstrap.  A
@@ -11,25 +11,25 @@ set -Eeuo pipefail
 umask 077
 
 PROGRAM=${0##*/}
-WORKDIR=${VPS2LINUX_WORKDIR:-/var/tmp/vps2linux}
-IMAGE_URL=${VPS2LINUX_IMAGE_URL:-}
-IMAGE_FILE=${VPS2LINUX_IMAGE_FILE:-}
-IMAGE_SHA256=${VPS2LINUX_IMAGE_SHA256:-}
-TARGET_DISK=${VPS2LINUX_DISK:-}
-TARGET_HOSTNAME=${VPS2LINUX_HOSTNAME:-}
-TARGET_INTERFACE=${VPS2LINUX_INTERFACE:-}
-TARGET_INTERFACE_NAMES=${VPS2LINUX_INTERFACE_NAMES:-}
-TARGET_MAC=${VPS2LINUX_MAC:-}
-TARGET_IPV4_CIDR=${VPS2LINUX_IPV4_CIDR:-}
-TARGET_GATEWAY=${VPS2LINUX_GATEWAY:-}
-TARGET_DNS=${VPS2LINUX_DNS:-}
-SSH_KEY_FILE=${VPS2LINUX_SSH_KEY_FILE:-/root/.ssh/authorized_keys}
-ROOT_SIZE_GIB=${VPS2LINUX_ROOT_SIZE_GIB:-64}
-CONFIG_SIZE_MIB=${VPS2LINUX_CONFIG_SIZE_MIB:-1024}
+WORKDIR=${VPS2IMG_PIVOT_WORKDIR:-/var/tmp/vps2img-pivot}
+IMAGE_URL=${VPS2IMG_PIVOT_IMAGE_URL:-}
+IMAGE_FILE=${VPS2IMG_PIVOT_IMAGE_FILE:-}
+IMAGE_SHA256=${VPS2IMG_PIVOT_IMAGE_SHA256:-}
+TARGET_DISK=${VPS2IMG_PIVOT_DISK:-}
+TARGET_HOSTNAME=${VPS2IMG_PIVOT_HOSTNAME:-}
+TARGET_INTERFACE=${VPS2IMG_PIVOT_INTERFACE:-}
+TARGET_INTERFACE_NAMES=${VPS2IMG_PIVOT_INTERFACE_NAMES:-}
+TARGET_MAC=${VPS2IMG_PIVOT_MAC:-}
+TARGET_IPV4_CIDR=${VPS2IMG_PIVOT_IPV4_CIDR:-}
+TARGET_GATEWAY=${VPS2IMG_PIVOT_GATEWAY:-}
+TARGET_DNS=${VPS2IMG_PIVOT_DNS:-}
+SSH_KEY_FILE=${VPS2IMG_PIVOT_SSH_KEY_FILE:-/root/.ssh/authorized_keys}
+ROOT_SIZE_GIB=${VPS2IMG_PIVOT_ROOT_SIZE_GIB:-64}
+CONFIG_SIZE_MIB=${VPS2IMG_PIVOT_CONFIG_SIZE_MIB:-1024}
 RAW_FILE=
 ROOT_SOURCE=
 SOURCE_DISK=
-BOOTSTRAP=/run/vps2linux-bootstrap
+BOOTSTRAP=/run/vps2img-pivot-bootstrap
 
 die() {
 	printf 'FATAL: %s\n' "$*" >&2
@@ -46,7 +46,7 @@ Usage: $PROGRAM [options]
 
 Discover and replace the current Linux installation with a raw image.
 The default action is a read-only plan.  --execute requires an exact
-VPS2LINUX_CONFIRM value before any disk is written.
+VPS2IMG_PIVOT_CONFIRM value before any disk is written.
 
 Options:
   --image-url URL       Raw image or SquashFS URL
@@ -69,7 +69,7 @@ Options:
 
 Examples:
   $PROGRAM --image-url http://10.68.247.14:16000/eiso/id/3/openSUSE-Leap-Micro.raw.squashfs
-  VPS2LINUX_CONFIRM=WIPE:/dev/sda $PROGRAM --execute \\
+  VPS2IMG_PIVOT_CONFIRM=WIPE:/dev/sda $PROGRAM --execute \\
     --image-file /run/leap-micro.raw --disk /dev/sda
 
 The configuration partition uses the Leap Micro Combustion contract:
@@ -233,7 +233,7 @@ print_plan() {
 	size_bytes=$(stat -c '%s' "$RAW_FILE")
 	disk_bytes=$(blockdev --getsize64 "$TARGET_DISK")
 	model=$(lsblk -dnro MODEL "$TARGET_DISK" | sed 's/[[:space:]]*$//')
-	printf '%s\n' '=== VPS2LINUX PLAN ==='
+	printf '%s\n' '=== VPS2IMG_PIVOT PLAN ==='
 	printf 'source root:    %s (%s)\n' "$ROOT_SOURCE" "$(findmnt -nro FSTYPE /)"
 	printf 'source disk:    %s\n' "$SOURCE_DISK"
 	printf 'target disk:    %s (%s bytes, %s)\n' "$TARGET_DISK" "$disk_bytes" "${model:-unknown model}"
@@ -338,7 +338,7 @@ flush_disk() {
 	blockdev --flushbufs "$DISK" || fail "cannot flush pending writes for $DISK"
 }
 
-printf '%s\n' '=== VPS2LINUX RAM DEPLOYMENT ==='
+printf '%s\n' '=== VPS2IMG_PIVOT RAM DEPLOYMENT ==='
 [[ "$(lsblk -dnro TYPE "$DISK")" == disk ]] || fail "not a whole disk: $DISK"
 [[ -s "$RAW" ]] || fail 'raw image is missing from the RAM bootstrap'
 flush_disk
@@ -408,9 +408,9 @@ elif fsfreeze --freeze /oldroot; then
 else
 	fail 'cannot freeze the former root; refusing to overwrite the target disk'
 fi
-if [[ -n "${VPS2LINUX_ROOT_SOURCE:-}" && -b "$VPS2LINUX_ROOT_SOURCE" ]]; then
-	blockdev --setro "$VPS2LINUX_ROOT_SOURCE" || \
-		printf '%s\n' "WARNING: cannot make old root read-only: $VPS2LINUX_ROOT_SOURCE" >&2
+if [[ -n "${VPS2IMG_PIVOT_ROOT_SOURCE:-}" && -b "$VPS2IMG_PIVOT_ROOT_SOURCE" ]]; then
+	blockdev --setro "$VPS2IMG_PIVOT_ROOT_SOURCE" || \
+		printf '%s\n' "WARNING: cannot make old root read-only: $VPS2IMG_PIVOT_ROOT_SOURCE" >&2
 fi
 umount -Rl /oldroot || fail 'cannot detach the former target root'
 
@@ -524,9 +524,9 @@ fi
 echo '$TARGET_HOSTNAME' > "\$ROOT/etc/hostname"
 
 mkdir -p "\$ROOT/etc/NetworkManager/system-connections"
-cat > "\$ROOT/etc/NetworkManager/system-connections/vps2linux.nmconnection" <<'NETWORK'
+cat > "\$ROOT/etc/NetworkManager/system-connections/vps2img-pivot.nmconnection" <<'NETWORK'
 [connection]
-id=vps2linux
+id=vps2img-pivot
 type=ethernet
 autoconnect=true
 
@@ -599,7 +599,7 @@ NETWORK
 		NETWORK_MATCH=name
 	fi
 	{
-		printf '%s\n' '[connection]' 'id=vps2linux' 'type=ethernet' 'autoconnect=true'
+		printf '%s\n' '[connection]' 'id=vps2img-pivot' 'type=ethernet' 'autoconnect=true'
 		if [[ "\$NETWORK_MATCH" == mac ]]; then
 			printf 'mac-address=%s\n' "\$TARGET_MAC"
 		elif [[ -n "\$SELECTED_INTERFACE" ]]; then
@@ -608,8 +608,8 @@ NETWORK
 		printf '%s\n' '' '[ipv4]'
 		printf 'method=manual\naddress1=%s,%s\ndns=%s\n' '$TARGET_IPV4_CIDR' '$TARGET_GATEWAY' '$TARGET_DNS'
 		printf '%s\n' '' '[ipv6]' 'method=disabled'
-	} > "\$ROOT/etc/NetworkManager/system-connections/vps2linux.nmconnection"
-	chmod 600 "\$ROOT/etc/NetworkManager/system-connections/vps2linux.nmconnection"
+	} > "\$ROOT/etc/NetworkManager/system-connections/vps2img-pivot.nmconnection"
+	chmod 600 "\$ROOT/etc/NetworkManager/system-connections/vps2img-pivot.nmconnection"
 
 mkdir -p "\$ROOT/root/.ssh"
 cat > "\$ROOT/root/.ssh/authorized_keys" <<'SSHKEYS'
@@ -619,7 +619,7 @@ chmod 700 "\$ROOT/root/.ssh"
 chmod 600 "\$ROOT/root/.ssh/authorized_keys"
 
 mkdir -p "\$ROOT/etc/ssh/sshd_config.d"
-cat > "\$ROOT/etc/ssh/sshd_config.d/90-vps2linux.conf" <<'SSHD'
+cat > "\$ROOT/etc/ssh/sshd_config.d/90-vps2img-pivot.conf" <<'SSHD'
 PermitRootLogin prohibit-password
 PubkeyAuthentication yes
 PasswordAuthentication no
@@ -655,8 +655,8 @@ trap - EXIT
 partx -u "$DISK" 2>/dev/null || true
 if [[ -d /sys/firmware/efi ]]; then
 	command -v efibootmgr >/dev/null 2>&1 || fail 'UEFI boot detected but efibootmgr is not staged'
-	efibootmgr -c -d "$DISK" -p 2 -L 'vps2linux' -l '\EFI\BOOT\BOOTX64.EFI' || \
-		fail 'efibootmgr could not create the vps2linux boot entry'
+	efibootmgr -c -d "$DISK" -p 2 -L 'vps2img-pivot' -l '\EFI\BOOT\BOOTX64.EFI' || \
+		fail 'efibootmgr could not create the vps2img-pivot boot entry'
 	efibootmgr -v || fail 'efibootmgr could not read the new boot entry'
 else
 	printf '%s\n' 'UEFI runtime unavailable; relying on the EFI fallback path or BIOS boot code.'
@@ -702,7 +702,7 @@ run_from_bootstrap() {
 	# Keep /oldroot mounted until the inner deployer has flushed it and
 	# switched it read-only by blockdev --setro. It then detaches it before
 	# writing the new image.
-	export VPS2LINUX_ROOT_SOURCE="$ROOT_SOURCE"
+	export VPS2IMG_PIVOT_ROOT_SOURCE="$ROOT_SOURCE"
 	# Run the deployer as a child so the RAM bootstrap shell remains available
 	# while the inner script freezes old userspace processes by name.
 	/usr/bin/bash /run/deploy "$TARGET_DISK"
@@ -760,8 +760,8 @@ main() {
 		printf '%s\n' 'DRY-RUN: no disk, mount, service, or reboot operation was performed.'
 		return 0
 	fi
-	[[ "${VPS2LINUX_CONFIRM:-}" == "WIPE:$TARGET_DISK" ]] || \
-		die "set VPS2LINUX_CONFIRM=WIPE:$TARGET_DISK to allow the destructive operation"
+	[[ "${VPS2IMG_PIVOT_CONFIRM:-}" == "WIPE:$TARGET_DISK" ]] || \
+		die "set VPS2IMG_PIVOT_CONFIRM=WIPE:$TARGET_DISK to allow the destructive operation"
 	[[ "$SOURCE_DISK" == "$TARGET_DISK" ]] || warn 'target is not the current root disk; verify it before continuing'
 	stage_bootstrap
 	run_from_bootstrap

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# vps2leapmicro - replace a running Linux installation with a raw Linux image by
+# vps2img-kexec - replace a running Linux installation with a raw Linux image by
 # booting a self-made initramfs with kexec.
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Plan 2 of vps2linux.  The pivot_root bootstrap of vps2linux cannot actually
+# Plan 2 of vps2img-pivot.  The pivot_root bootstrap of vps2img-pivot cannot actually
 # stop the old kernel from writing the target disk: old systemd, old btrfs
 # async discard and old writeback keep touching the device after dd.  This
 # script instead loads the running kernel plus a purpose-built initramfs with
@@ -30,33 +30,33 @@ set -Eeuo pipefail
 # runs /deploy, which rebuilds the GPT, creates the Combustion partition and the
 # EFI boot entry.  On any failure it stays alive with SSH instead of dying.
 #
-# The destructive part keeps the same contract as vps2linux: the default is a
+# The destructive part keeps the same contract as vps2img-pivot: the default is a
 # read-only plan, and writing requires both --execute and
-# VPS2LEAPMICRO_CONFIRM=WIPE:<disk>.
+# VPS2IMG_KEXEC_CONFIRM=WIPE:<disk>.
 
 umask 077
 
 PROGRAM=${0##*/}
-WORKDIR=${VPS2LEAPMICRO_WORKDIR:-/var/tmp/vps2leapmicro}
-IMAGE_URL=${VPS2LEAPMICRO_IMAGE_URL:-}
-IMAGE_FILE=${VPS2LEAPMICRO_IMAGE_FILE:-}
-IMAGE_SHA256=${VPS2LEAPMICRO_IMAGE_SHA256:-}
-IMAGE_SIZE=${VPS2LEAPMICRO_IMAGE_SIZE:-}
-IMAGE_MODE_REQUEST=${VPS2LEAPMICRO_IMAGE_MODE:-auto}
-TARGET_DISK=${VPS2LEAPMICRO_DISK:-}
-TARGET_HOSTNAME=${VPS2LEAPMICRO_HOSTNAME:-}
-TARGET_INTERFACE=${VPS2LEAPMICRO_INTERFACE:-}
-TARGET_INTERFACE_NAMES=${VPS2LEAPMICRO_INTERFACE_NAMES:-}
-TARGET_MAC=${VPS2LEAPMICRO_MAC:-}
-TARGET_IPV4_CIDR=${VPS2LEAPMICRO_IPV4_CIDR:-}
-TARGET_GATEWAY=${VPS2LEAPMICRO_GATEWAY:-}
-TARGET_DNS=${VPS2LEAPMICRO_DNS:-}
-TARGET_USER=${VPS2LEAPMICRO_USER:-root}
-TARGET_PASSWORD=${VPS2LEAPMICRO_PASSWORD:-}
-SSH_KEY_FILE=${VPS2LEAPMICRO_SSH_KEY_FILE:-/root/.ssh/authorized_keys}
-ROOT_SIZE_GIB=${VPS2LEAPMICRO_ROOT_SIZE_GIB:-64}
-CONFIG_SIZE_MIB=${VPS2LEAPMICRO_CONFIG_SIZE_MIB:-1024}
-KEXEC_KERNEL=${VPS2LEAPMICRO_KERNEL:-}
+WORKDIR=${VPS2IMG_KEXEC_WORKDIR:-/var/tmp/vps2img-kexec}
+IMAGE_URL=${VPS2IMG_KEXEC_IMAGE_URL:-}
+IMAGE_FILE=${VPS2IMG_KEXEC_IMAGE_FILE:-}
+IMAGE_SHA256=${VPS2IMG_KEXEC_IMAGE_SHA256:-}
+IMAGE_SIZE=${VPS2IMG_KEXEC_IMAGE_SIZE:-}
+IMAGE_MODE_REQUEST=${VPS2IMG_KEXEC_IMAGE_MODE:-auto}
+TARGET_DISK=${VPS2IMG_KEXEC_DISK:-}
+TARGET_HOSTNAME=${VPS2IMG_KEXEC_HOSTNAME:-}
+TARGET_INTERFACE=${VPS2IMG_KEXEC_INTERFACE:-}
+TARGET_INTERFACE_NAMES=${VPS2IMG_KEXEC_INTERFACE_NAMES:-}
+TARGET_MAC=${VPS2IMG_KEXEC_MAC:-}
+TARGET_IPV4_CIDR=${VPS2IMG_KEXEC_IPV4_CIDR:-}
+TARGET_GATEWAY=${VPS2IMG_KEXEC_GATEWAY:-}
+TARGET_DNS=${VPS2IMG_KEXEC_DNS:-}
+TARGET_USER=${VPS2IMG_KEXEC_USER:-root}
+TARGET_PASSWORD=${VPS2IMG_KEXEC_PASSWORD:-}
+SSH_KEY_FILE=${VPS2IMG_KEXEC_SSH_KEY_FILE:-/root/.ssh/authorized_keys}
+ROOT_SIZE_GIB=${VPS2IMG_KEXEC_ROOT_SIZE_GIB:-64}
+CONFIG_SIZE_MIB=${VPS2IMG_KEXEC_CONFIG_SIZE_MIB:-1024}
+KEXEC_KERNEL=${VPS2IMG_KEXEC_KERNEL:-}
 IMAGE_MODE=
 IMAGE_RAW_URL=
 RAW_FILE=
@@ -73,17 +73,17 @@ SOURCE_DISK=
 STAGE=$WORKDIR/initramfs-root
 INITRAMFS=$WORKDIR/initramfs.cpio.gz
 
-# vps2leapmicro: where the deploy ramdisk's userspace comes from.  "host" (default)
+# vps2img-kexec: where the deploy ramdisk's userspace comes from.  "host" (default)
 # stages the running host's busybox and binaries.  "debian" fetches the Debian
 # installer (d-i) netboot initrd plus the required .deb/.udeb packages over plain
 # HTTP and assembles the ramdisk without ever touching the host package manager,
 # so a non-apt source host (RHEL/openSUSE/...) can build it without preinstalling
 # the deploy tools.  Either way kexec loads the RUNNING kernel, so only the
 # userspace of the ramdisk is replaced.
-RAMDISK_SOURCE=${VPS2LEAPMICRO_RAMDISK_SOURCE:-host}
-DI_MIRROR=${VPS2LEAPMICRO_DI_MIRROR:-http://deb.debian.org/debian}
-DI_SUITE=${VPS2LEAPMICRO_DI_SUITE:-stable}
-DI_ARCH=${VPS2LEAPMICRO_DI_ARCH:-amd64}
+RAMDISK_SOURCE=${VPS2IMG_KEXEC_RAMDISK_SOURCE:-host}
+DI_MIRROR=${VPS2IMG_KEXEC_DI_MIRROR:-http://deb.debian.org/debian}
+DI_SUITE=${VPS2IMG_KEXEC_DI_SUITE:-stable}
+DI_ARCH=${VPS2IMG_KEXEC_DI_ARCH:-amd64}
 DI_DEB_INDEX=$WORKDIR/di-index-deb.txt
 DI_UDEB_INDEX=$WORKDIR/di-index-udeb.txt
 declare -A DI_PKG_FILE=()
@@ -116,7 +116,7 @@ deploy a raw image to the target disk from that initramfs.  The old kernel,
 systemd and filesystem are gone before the image is written.  By default the
 raw image is streamed over HTTP directly to the target disk, so it never has to
 fit in RAM.  The default action is a read-only plan; --execute requires an
-exact VPS2LEAPMICRO_CONFIRM value.
+exact VPS2IMG_KEXEC_CONFIRM value.
 
 Options:
   --image-url URL       Raw image URL (default: streamed to the target disk).
@@ -162,7 +162,7 @@ Options:
 
 Examples:
   # Recommended: stream a raw image from HTTP (low RAM)
-  VPS2LEAPMICRO_CONFIRM=WIPE:/dev/sda $PROGRAM --execute \\
+  VPS2IMG_KEXEC_CONFIRM=WIPE:/dev/sda $PROGRAM --execute \\
     --image-url http://10.68.247.224:18080/openSUSE-Leap-Micro.raw \\
     --sha256 <raw-image-sha256> --disk /dev/sda \\
     --hostname target --user leap --password '<password>' \\
@@ -472,7 +472,7 @@ print_plan() {
 	size_bytes=${RAW_SIZE:-0}
 	disk_bytes=$(blockdev --getsize64 "$TARGET_DISK")
 	model=$(lsblk -dnro MODEL "$TARGET_DISK" | sed 's/[[:space:]]*$//')
-	printf '%s\n' '=== VPS2LEAPMICRO PLAN ==='
+	printf '%s\n' '=== VPS2IMG_KEXEC PLAN ==='
 	printf 'boot method:     kexec (%s)\n' "$KEXEC_KERNEL"
 	printf 'ramdisk source:  %s\n' "$(ramdisk_source_description)"
 	printf 'image mode:      %s\n' "$IMAGE_MODE"
@@ -622,8 +622,8 @@ export PATH
 /bin/busybox --install -s /bin 2>/dev/null || true
 
 log() {
-	printf '[vps2leapmicro] %s\n' "$*"
-	printf '[vps2leapmicro] %s\n' "$*" > /dev/kmsg 2>/dev/null || true
+	printf '[vps2img-kexec] %s\n' "$*"
+	printf '[vps2img-kexec] %s\n' "$*" > /dev/kmsg 2>/dev/null || true
 }
 
 mount -t proc proc /proc 2>/dev/null || true
@@ -774,7 +774,7 @@ rescue() {
 	done
 }
 
-trap 'printf "[vps2leapmicro] init exiting rc=%s\n" "$?" > /dev/kmsg 2>/dev/null; rescue' EXIT
+trap 'printf "[vps2img-kexec] init exiting rc=%s\n" "$?" > /dev/kmsg 2>/dev/null; rescue' EXIT
 log "kexec initramfs is up, kernel $(uname -r)"
 log "target disk ${DISK:-unknown}, image mode ${IMAGE_MODE:-stream}"
 
@@ -804,7 +804,7 @@ start_dropbear
 # would show MemAvailable collapsing.
 (
 	while :; do
-		awk '/MemAvailable/ { printf "[vps2leapmicro] MemAvailable=%s kB\n", $2 }' /proc/meminfo > /dev/kmsg 2>/dev/null || true
+		awk '/MemAvailable/ { printf "[vps2img-kexec] MemAvailable=%s kB\n", $2 }' /proc/meminfo > /dev/kmsg 2>/dev/null || true
 		sleep 20
 	done
 ) &
@@ -845,7 +845,7 @@ flush_disk() {
 	blockdev --flushbufs "$DISK" || fail "cannot flush pending writes for $DISK"
 }
 
-printf '%s\n' '=== VPS2LEAPMICRO INITRAMFS DEPLOYMENT ==='
+printf '%s\n' '=== VPS2IMG_KEXEC INITRAMFS DEPLOYMENT ==='
 [[ "$(lsblk -dnro TYPE "$DISK")" == disk ]] || fail "not a whole disk: $DISK"
 flush_disk
 
@@ -971,9 +971,9 @@ fi
 echo '$TARGET_HOSTNAME' > "\$ROOT/etc/hostname"
 
 mkdir -p "\$ROOT/etc/NetworkManager/system-connections"
-cat > "\$ROOT/etc/NetworkManager/system-connections/vps2leapmicro.nmconnection" <<'NETWORK'
+cat > "\$ROOT/etc/NetworkManager/system-connections/vps2img-kexec.nmconnection" <<'NETWORK'
 [connection]
-id=vps2leapmicro
+id=vps2img-kexec
 type=ethernet
 autoconnect=true
 
@@ -1046,7 +1046,7 @@ NETWORK
 		NETWORK_MATCH=name
 	fi
 	{
-		printf '%s\n' '[connection]' 'id=vps2leapmicro' 'type=ethernet' 'autoconnect=true'
+		printf '%s\n' '[connection]' 'id=vps2img-kexec' 'type=ethernet' 'autoconnect=true'
 		if [[ "\$NETWORK_MATCH" == mac ]]; then
 			printf 'mac-address=%s\n' "\$TARGET_MAC"
 		elif [[ -n "\$SELECTED_INTERFACE" ]]; then
@@ -1055,8 +1055,8 @@ NETWORK
 		printf '%s\n' '' '[ipv4]'
 		printf 'method=manual\naddress1=%s,%s\ndns=%s\n' '$TARGET_IPV4_CIDR' '$TARGET_GATEWAY' '$TARGET_DNS'
 		printf '%s\n' '' '[ipv6]' 'method=disabled'
-	} > "\$ROOT/etc/NetworkManager/system-connections/vps2leapmicro.nmconnection"
-	chmod 600 "\$ROOT/etc/NetworkManager/system-connections/vps2leapmicro.nmconnection"
+	} > "\$ROOT/etc/NetworkManager/system-connections/vps2img-kexec.nmconnection"
+	chmod 600 "\$ROOT/etc/NetworkManager/system-connections/vps2img-kexec.nmconnection"
 
 mkdir -p "\$ROOT/root/.ssh"
 cat > "\$ROOT/root/.ssh/authorized_keys" <<'SSHKEYS'
@@ -1120,7 +1120,7 @@ ensure_user
 # under /etc, so the requested user ends up with a working authorized_keys.
 if [[ '$TARGET_USER' != root ]]; then
 	mkdir -p "\$ROOT/etc/systemd/system"
-	cat > "\$ROOT/etc/systemd/system/vps2leapmicro-user-home.service" <<UNIT
+	cat > "\$ROOT/etc/systemd/system/vps2img-kexec-user-home.service" <<UNIT
 [Unit]
 Description=Create home and SSH authorized_keys for $TARGET_USER
 After=local-fs.target
@@ -1135,11 +1135,11 @@ ExecStart=/usr/bin/chown -R $TARGET_USER:$TARGET_USER /home/$TARGET_USER
 [Install]
 WantedBy=multi-user.target
 UNIT
-	systemctl --root="\$ROOT" enable vps2leapmicro-user-home.service
+	systemctl --root="\$ROOT" enable vps2img-kexec-user-home.service
 fi
 
 mkdir -p "\$ROOT/etc/ssh/sshd_config.d"
-cat > "\$ROOT/etc/ssh/sshd_config.d/90-vps2leapmicro.conf" <<SSHD
+cat > "\$ROOT/etc/ssh/sshd_config.d/90-vps2img-kexec.conf" <<SSHD
 PermitRootLogin $SSHD_ROOT_LOGIN
 PubkeyAuthentication yes
 AuthorizedKeysFile .ssh/authorized_keys /etc/ssh/authorized_keys.d/%u
@@ -1231,8 +1231,8 @@ fi
 
 if [[ -d /sys/firmware/efi ]]; then
 	command -v efibootmgr >/dev/null 2>&1 || fail 'UEFI boot detected but efibootmgr is not staged'
-	efibootmgr -c -d "$DISK" -p 2 -L 'vps2leapmicro' -l '\EFI\BOOT\BOOTX64.EFI' || \
-		fail 'efibootmgr could not create the vps2leapmicro boot entry'
+	efibootmgr -c -d "$DISK" -p 2 -L 'vps2img-kexec' -l '\EFI\BOOT\BOOTX64.EFI' || \
+		fail 'efibootmgr could not create the vps2img-kexec boot entry'
 	efibootmgr -v || fail 'efibootmgr could not read the new boot entry'
 else
 	printf '%s\n' 'UEFI runtime unavailable; relying on the EFI fallback path or BIOS boot code.'
@@ -1621,7 +1621,7 @@ unload_kexec_image() {
 
 run_kexec() {
 	local command_line
-	command_line="console=ttyS0,115200 console=tty0 panic=120 vps2leapmicro.disk=$TARGET_DISK"
+	command_line="console=ttyS0,115200 console=tty0 panic=120 vps2img-kexec.disk=$TARGET_DISK"
 	load_kexec_image "$command_line"
 	printf '%s\n' 'Switching kernels with kexec -e; the old kernel and systemd are discarded now.'
 	sync
@@ -1684,10 +1684,10 @@ main() {
 		ensure_host_kexec
 		build_initramfs
 		printf 'STAGE-TEST: initramfs is %s bytes\n' "$(stat -c '%s' "$INITRAMFS")"
-		load_kexec_image "console=ttyS0,115200 console=tty0 panic=120 vps2leapmicro.disk=$TARGET_DISK"
+		load_kexec_image "console=ttyS0,115200 console=tty0 panic=120 vps2img-kexec.disk=$TARGET_DISK"
 		unload_kexec_image
 		printf '%s\n' "STAGE-TEST: initramfs scripts syntax-checked and kexec load/unload succeeded (method=$KEXEC_METHOD); no kernel switch and no disk change."
-		[[ "${VPS2LEAPMICRO_KEEP_INITRAMFS:-0}" == 1 ]] || rm -f "$INITRAMFS"
+		[[ "${VPS2IMG_KEXEC_KEEP_INITRAMFS:-0}" == 1 ]] || rm -f "$INITRAMFS"
 		return 0
 	fi
 
@@ -1695,8 +1695,8 @@ main() {
 		printf '%s\n' 'DRY-RUN: no disk, mount, kexec, or reboot operation was performed.'
 		return 0
 	fi
-	[[ "${VPS2LEAPMICRO_CONFIRM:-}" == "WIPE:$TARGET_DISK" ]] || \
-		die "set VPS2LEAPMICRO_CONFIRM=WIPE:$TARGET_DISK to allow the destructive operation"
+	[[ "${VPS2IMG_KEXEC_CONFIRM:-}" == "WIPE:$TARGET_DISK" ]] || \
+		die "set VPS2IMG_KEXEC_CONFIRM=WIPE:$TARGET_DISK to allow the destructive operation"
 	[[ "$SOURCE_DISK" == "$TARGET_DISK" ]] || warn 'target is not the current root disk; verify it before continuing'
 	ensure_host_kexec
 	build_initramfs

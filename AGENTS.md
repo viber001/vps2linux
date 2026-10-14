@@ -1,8 +1,8 @@
-# vps2linux 接手说明
+# vps2img-pivot 接手说明
 
 ## 项目目标
 
-`vps2linux` 用当前运行中的 Linux 作为 bootstrap，把另一套 Linux raw image 部署到整块目标盘。由于目标盘同时承载当前 root，部署工具和镜像必须先复制到独立的 RAM-backed bootstrap，再通过 `pivot_root` 脱离旧系统，最后覆盖目标盘。
+`vps2img-pivot` 用当前运行中的 Linux 作为 bootstrap，把另一套 Linux raw image 部署到整块目标盘。由于目标盘同时承载当前 root，部署工具和镜像必须先复制到独立的 RAM-backed bootstrap，再通过 `pivot_root` 脱离旧系统，最后覆盖目标盘。
 
 这是一个破坏性实验工具，默认只执行探测和 dry-run。不要把它当作通用安装器或在线升级工具。
 
@@ -28,7 +28,7 @@ http://10.68.247.14:16000/eiso/id/3/
 
 - 当前开发分支为 `main`。
 - `master` 保留原始 `vps2arch` 备份，不要在 `master` 上开发。
-- 主入口是 `vps2linux`，用户文档是 `README.md`。
+- 主入口是 `vps2img-pivot`，用户文档是 `README.md`。
 - 本地部署环境、地址、主机名、MAC、快照和访问方式放在被忽略的 `AGENTS.private.md`，不要提交或发布。
 
 ## 执行流程
@@ -37,7 +37,7 @@ http://10.68.247.14:16000/eiso/id/3/
 
 1. 识别当前 root、底层 whole disk、文件系统和网络接口。
 2. 获取 raw image 或 SquashFS image，并校验 raw image SHA256。
-3. 生成只读计划；只有 `--execute` 和精确的 `VPS2LINUX_CONFIRM=WIPE:<disk>` 同时存在时才继续。
+3. 生成只读计划；只有 `--execute` 和精确的 `VPS2IMG_PIVOT_CONFIRM=WIPE:<disk>` 同时存在时才继续。
 4. 创建独立 RAM tmpfs，复制所需二进制、动态库、镜像和配置。
 5. 脱离目标盘上的非 root 挂载点，`pivot_root` 到 RAM bootstrap。
 6. flush pending writes，冻结旧 userspace，尝试只读重挂旧 root 并严格卸载。
@@ -79,7 +79,7 @@ sda4  ext4，label=combustion，扩展到磁盘末尾，不留空闲空间
 所有环境相关值都必须由调用者提供，不要把真实地址写入源码或公开文档：
 
 ```bash
-./vps2linux --dry-run \
+./vps2img-pivot --dry-run \
   --image-file /path/to/leap-micro.raw \
   --sha256 "$RAW_IMAGE_SHA256" \
   --disk /dev/sdX \
@@ -118,13 +118,13 @@ sda4  ext4，label=combustion，扩展到磁盘末尾，不留空闲空间
 2. 目标 raw image 内置进 initramfs，或在 initramfs 内通过 RAM 网络获取（配置临时静态 IP，HTTP 下载并校验 SHA256）；受 initramfs 大小限制时优先“RAM 内网络获取”。
 3. 用 `kexec -l` 加载新内核与 initramfs，`kexec -e` 直接切换；旧内核、旧 systemd、旧 btrfs 被完整废弃，不再有旧 root 的 discard/writeback。
 4. 新 initramfs 的 PID1 负责识别目标盘、按 `--root-size-gib` 重建 GPT、写入 image、创建 Combustion 分区并写入配置、创建 EFI 启动项，最后 `reboot -f`。
-5. 复用现有的只读计划、`--execute`/`VPS2LINUX_CONFIRM` 双重保护、参数校验和 Combustion 生成逻辑。
+5. 复用现有的只读计划、`--execute`/`VPS2IMG_PIVOT_CONFIRM` 双重保护、参数校验和 Combustion 生成逻辑。
 
 要点：kexec 需要内核支持，且加载的内核与 initramfs 必须匹配；initramfs 必须自带 GPT 和文件系统工具；网络下载需要 initramfs 内有网卡驱动和 DHCP 或静态网络配置。建议以参数开关（例如 `--boot-method kexec`）与现有 `pivot_root` 路径并存，先在 disposable VM 中验证后再考虑设为默认。
 
 ## 安全规则
 
-- 不要移除 `--execute` 或 `VPS2LINUX_CONFIRM` 双重保护。
+- 不要移除 `--execute` 或 `VPS2IMG_PIVOT_CONFIRM` 双重保护。
 - 不要把密码、私钥、authorized_keys 内容、真实内网地址或生产主机信息提交到仓库。
 - 任何 destructive test 前先确认快照存在。
 - 修改 GPT 后从独立系统检查，不要依赖当前内核的 partition mapping。
@@ -133,7 +133,7 @@ sda4  ext4，label=combustion，扩展到磁盘末尾，不留空闲空间
 ## 开发检查
 
 ```bash
-bash -n vps2linux
+bash -n vps2img-pivot
 ```
 
 本地环境信息读取：

@@ -1,10 +1,10 @@
-# vps2linux 原理与研发测试记录
+# vps2img-pivot 原理与研发测试记录
 
-`vps2linux` 是**不使用 kexec** 的部署方式：它把部署工具和 raw image 放进一个 RAM-backed bootstrap，再用 `pivot_root` 离开旧系统，从 RAM 里把 image 写到目标整盘。本文记录它的原理、它与 kexec 方案（`vps2leapmicro`）的取舍，以及早期研发测试过程。
+`vps2img-pivot` 是**不使用 kexec** 的部署方式：它把部署工具和 raw image 放进一个 RAM-backed bootstrap，再用 `pivot_root` 离开旧系统，从 RAM 里把 image 写到目标整盘。本文记录它的原理、它与 kexec 方案（`vps2img-kexec`）的取舍，以及早期研发测试过程。
 
 ## 与 kexec 方案的区别
 
-| | vps2linux | vps2leapmicro |
+| | vps2img-pivot | vps2img-kexec |
 |---|---|---|
 | 脱离旧系统的方式 | `pivot_root` 到 RAM tmpfs | `kexec` 切内核 |
 | 旧内核/旧 systemd | **仍然存活**（仅 `SIGSTOP` 冻结） | 被完整废弃 |
@@ -41,21 +41,21 @@ RAM bootstrap 内层部署
 └──────────────────────────────────────┘
 ```
 
-目标首启由镜像自带引导程序启动，dracut 的 `35combustion` 按 label `combustion` 找到配置分区并执行 `/combustion/script`。这与 `vps2leapmicro` 完全一致（见 `vps2leapmicro.md`）。
+目标首启由镜像自带引导程序启动，dracut 的 `35combustion` 按 label `combustion` 找到配置分区并执行 `/combustion/script`。这与 `vps2img-kexec` 完全一致（见 `vps2img-kexec.md`）。
 
 ## 为什么仍然不安全（方案 2 的由来）
 
 `pivot_root` 只切换了挂载命名空间的根，**并不会终止旧 init 系统**：旧 kernel、旧 PID1、旧 Btrfs 都仍在运行（脚本通过 `kill -STOP 1` 和一组 `SIGSTOP` 冻结，但这只是暂停，不是撤销）。旧 root 的 **async discard** 与**脏页回写**可能在内层 `dd` 写完之后才落盘，从而破坏刚写入的镜像。这层不确定性就是 AGENTS.md 提出“方案 2：kexec + 自制 initramfs”的根本原因——kexec 真正废弃旧内核，从根上消除该风险。
 
-因此 vps2linux 是**可用但安全余量较低**的方案，面向 kexec 不可用的环境。
+因此 vps2img-pivot 是**可用但安全余量较低**的方案，面向 kexec 不可用的环境。
 
 ## 研发测试过程
 
-全部提交（`git log --oneline -- vps2linux`）：
+全部提交（`git log --oneline -- vps2img-pivot`）：
 
-### 1. `006165b` Add vps2linux raw image deployer
+### 1. `006165b` Add vps2img-pivot raw image deployer
 
-初版：从运行中的系统把 raw image 部署到整盘，采用 RAM bootstrap + `pivot_root`。安全门控：默认只 dry-run，只有 `--execute` + `VPS2LINUX_CONFIRM=WIPE:<disk>` 同时存在才擦盘。
+初版：从运行中的系统把 raw image 部署到整盘，采用 RAM bootstrap + `pivot_root`。安全门控：默认只 dry-run，只有 `--execute` + `VPS2IMG_PIVOT_CONFIRM=WIPE:<disk>` 同时存在才擦盘。
 
 ### 2. `6955304` / `fe50a93` 记录测试环境与 iVentoy 背景
 
@@ -93,7 +93,7 @@ RAM bootstrap 内层部署
 mount -o remount,nodiscard /oldroot      # 只读 remount 会 EBUSY，但纯 discard 关停会被接受
 flush_disk                                # sync + blockdev --flushbufs
 fsfreeze --freeze /oldroot                # 必须成功，否则拒绝覆盖（写入前会把上面缓冲刷下去）
-blockdev --setro "$VPS2LINUX_ROOT_SOURCE" # 失败仅告警
+blockdev --setro "$VPS2IMG_PIVOT_ROOT_SOURCE" # 失败仅告警
 umount -Rl /oldroot                       # 懒卸载
 ```
 
@@ -101,14 +101,14 @@ umount -Rl /oldroot                       # 懒卸载
 
 ### 6. 验证结果
 
-- VM 600（PVE ext4+LVM 源）：RAM bootstrap 覆盖为 Leap Micro `EFI+Btrfs`，`efibootmgr` 建 `vps2linux` 启动项，Combustion 首启生效静态 IP 与 SSH 公钥。
+- VM 600（PVE ext4+LVM 源）：RAM bootstrap 覆盖为 Leap Micro `EFI+Btrfs`，`efibootmgr` 建 `vps2img-pivot` 启动项，Combustion 首启生效静态 IP 与 SSH 公钥。
 - VM 602（PVE Btrfs 源，400 GiB）：端到端成功，root 100 GiB、Combustion 填满剩余空间；首启后 hostname、静态 IPv4、SSH 公钥均由 Combustion 生效。
 - 加入 `nodiscard`+`fsfreeze` 缓解后，多轮部署得到干净结果（无 `csum failed`，`ld-linux` 完整）。
 - **间歇性故障**：曾出现一次 `pivot_root` 之后面板侧突然复位（无内核 panic、非 watchdog、非脚本错误路径），第二次 `qm reset` 可恢复；其余轮次均干净。原因未最终定位。
 
 ## 已知限制
 
-- 旧内核/旧 systemd 未真正终止，存在理论上的旧 root 写回/损坏风险；缓解只降低概率，不根除。要根除请用 `vps2leapmicro`（kexec）。
+- 旧内核/旧 systemd 未真正终止，存在理论上的旧 root 写回/损坏风险；缓解只降低概率，不根除。要根除请用 `vps2img-kexec`（kexec）。
 - `root=ro` 只影响新系统启动后的 root，不能替代 bootstrap。
 - QEMU/zvol 可能保留旧分区映射；改 GPT 后必须从重启/外部系统复核 on-disk GPT。
 - 破坏性工具：目标盘必须有独立控制台、救援介质或可回滚快照；默认只探测与 dry-run。
