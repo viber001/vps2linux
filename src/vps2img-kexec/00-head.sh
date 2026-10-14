@@ -81,10 +81,20 @@ INITRAMFS=$WORKDIR/initramfs.cpio.gz
 # so a non-apt source host (RHEL/openSUSE/...) can build it without preinstalling
 # the deploy tools.  Either way kexec loads the RUNNING kernel, so only the
 # userspace of the ramdisk is replaced.
-RAMDISK_SOURCE=${VPS2IMG_KEXEC_RAMDISK_SOURCE:-host}
+# Where the deploy ramdisk userspace comes from (see resolve_ramdisk_source):
+#   auto   (default) use the host tools when the host has them all, otherwise
+#          fetch the Debian installer components over HTTP
+#   host   force staging the running host's tools; fail if any are missing
+#   debian force the HTTP download (needs no host package manager)
+#   apt    install the missing host tools with apt-get, then stage the host
+RAMDISK_SOURCE=${VPS2IMG_KEXEC_RAMDISK_SOURCE:-auto}
 DI_MIRROR=${VPS2IMG_KEXEC_DI_MIRROR:-http://deb.debian.org/debian}
 DI_SUITE=${VPS2IMG_KEXEC_DI_SUITE:-stable}
 DI_ARCH=${VPS2IMG_KEXEC_DI_ARCH:-amd64}
+# Static busybox used only as a last-resort ar reader (see ar_command).  The
+# BusyBox project ships prebuilt static binaries, so this needs no package
+# manager and no ar to unpack.
+STATIC_BUSYBOX_URL=${VPS2IMG_KEXEC_STATIC_BUSYBOX_URL:-https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox}
 DI_DEB_INDEX=$WORKDIR/di-index-deb.txt
 DI_UDEB_INDEX=$WORKDIR/di-index-udeb.txt
 declare -A DI_PKG_FILE=()

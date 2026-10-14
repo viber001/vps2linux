@@ -1,8 +1,8 @@
 # vps2img-pivot and vps2img-kexec are assembled from small fragments under src/
 # so that the code shared by both deployers lives in exactly one place.  Edit the
 # fragments, then run `make` to regenerate the two top-level scripts.  The
-# generated scripts are committed as well, so a plain `scp` still works without
-# running make.
+# generated scripts are gitignored (only the fragments are tracked), so run
+# `make` before copying or scp'ing a script to a target.
 #
 # Every fragment carries a leading number and is merged in ascending numeric
 # order, so the shared src/lib blocks slot in between the program blocks: lib
@@ -26,10 +26,10 @@ vps2img-kexec: $(sources)
 		--dirs src/vps2img-kexec src/lib --assets src/assets > $@
 	chmod 0755 $@
 
-# Rebuild from the fragments and fail if the committed scripts are stale.
+# Rebuild from the fragments and syntax-check the generated scripts.
 check:
 	@$(MAKE) --no-print-directory all >/dev/null
 	@bash -n vps2img-pivot && bash -n vps2img-kexec
-	@echo 'vps2img-pivot and vps2img-kexec are up to date'
+	@echo 'vps2img-pivot and vps2img-kexec rebuilt and syntax-checked'
 
 .PHONY: all check

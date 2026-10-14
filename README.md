@@ -34,6 +34,13 @@ http://10.68.247.14:16000/eiso/id/3/
 
 ## 当前用法
 
+两个入口脚本由 `src/` 片段经 `make` 生成（生成物已加入 `.gitignore`，不随仓库提交）：
+
+```bash
+make            # 生成 ./vps2img-pivot 和 ./vps2img-kexec
+make check      # 重建并做 bash -n 语法检查
+```
+
 先执行只读计划：
 
 ```bash

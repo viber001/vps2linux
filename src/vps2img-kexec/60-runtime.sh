@@ -194,7 +194,7 @@ print_plan() {
 
 check_dependencies() {
 	local command_name archive
-	for command_name in awk ar blockdev cp cpio find findmnt gzip lsblk mount readlink rm sha256sum sfdisk stat sync tar tr umount; do
+	for command_name in awk blockdev cp cpio find findmnt gzip lsblk mount readlink rm sha256sum sfdisk stat sync tar tr umount; do
 		need_command "$command_name"
 	done
 	for command_name in hostname ip modinfo modprobe mountpoint paste sort; do
@@ -209,7 +209,7 @@ check_dependencies() {
 	# ensure_host_kexec and never through the host package manager.
 	if [[ "$RAMDISK_SOURCE" == host ]]; then
 		for command_name in busybox dropbearkey sgdisk; do
-			command -v "$command_name" >/dev/null 2>&1 || die "required command is missing: $command_name (install it, or use --ramdisk-source debian to fetch the tools over HTTP)"
+			command -v "$command_name" >/dev/null 2>&1 || die "required command is missing: $command_name (install it, or use --ramdisk-source auto or debian to fetch the tools over HTTP)"
 		done
 	fi
 	# unsquashfs is only needed in embed mode when the source is an archive.
@@ -219,6 +219,100 @@ check_dependencies() {
 			need_command unsquashfs
 		fi
 	fi
+}
+
+# ar_command returns an ar reader for .deb/.udeb members.  A minimal system
+# may ship no ar at all (openSUSE Leap Micro has no binutils) and its busybox
+# may lack the applet, so as a last resort download the static busybox the
+# BusyBox project publishes, instead of forcing a package onto the host.
+download_static_busybox() {
+	local path=$WORKDIR/busybox-static
+	if [[ ! -x "$path" ]]; then
+		download_file "$STATIC_BUSYBOX_URL" "$path" >&2 || die "cannot download a static busybox from $STATIC_BUSYBOX_URL"
+		chmod 0755 "$path"
+	fi
+	printf '%s\n' "$path"
+}
+
+ar_command() {
+	if command -v ar >/dev/null 2>&1; then
+		ar "$@"
+	elif command -v busybox >/dev/null 2>&1 && [[ " $(busybox --list 2>/dev/null | tr '\n' ' ') " == *' ar '* ]]; then
+		busybox ar "$@"
+	else
+		"$(download_static_busybox)" ar "$@"
+	fi
+}
+
+# host_tool_commands lists the tools that only host mode needs on the host,
+# beyond the base archive tooling that every mode requires.
+host_tool_commands() {
+	printf '%s\n' busybox dropbearkey kexec sgdisk
+}
+
+# host_tool_package maps a tool to the package that provides it, for --ramdisk-source apt.
+host_tool_package() {
+	case "$1" in
+		busybox) printf 'busybox\n' ;;
+		dropbearkey) printf 'dropbear\n' ;;
+		kexec) printf 'kexec-tools\n' ;;
+		sgdisk) printf 'gdisk\n' ;;
+		*) printf '%s\n' "$1" ;;
+	esac
+}
+
+# missing_host_tools prints, one per line, the host-mode tools that are absent.
+missing_host_tools() {
+	local command_name
+	for command_name in $(host_tool_commands); do
+		command -v "$command_name" >/dev/null 2>&1 || printf '%s\n' "$command_name"
+	done
+}
+
+# resolve_ramdisk_source turns the requested RAMDISK_SOURCE (auto, host, debian
+# or apt) into the effective host or debian mode.  auto prefers the host when
+# it already has every tool, otherwise it downloads; apt installs the missing
+# tools through apt-get first and then stages the host.  A system with no
+# package manager (openSUSE Leap Micro, for example) must use auto or debian.
+resolve_ramdisk_source() {
+	local command_name missing packages=()
+	case "$RAMDISK_SOURCE" in
+		host) ;;
+		debian) ;;
+		auto)
+			missing=$(missing_host_tools)
+			if [[ -z "$missing" ]]; then
+				printf '%s\n' 'Ramdisk source: the host already provides every tool; staging the host.'
+			else
+				printf 'Ramdisk source: the host lacks %s; fetching the Debian installer components over HTTP.\n' \
+					"$(printf '%s ' $missing | sed 's/ $//')"
+				RAMDISK_SOURCE=debian
+			fi
+			;;
+		apt)
+			command -v apt-get >/dev/null 2>&1 || \
+				die '--ramdisk-source apt needs apt-get, which this host does not provide (use auto or debian to download instead)'
+			missing=$(missing_host_tools)
+			if [[ -z "$missing" ]]; then
+				printf '%s\n' 'Ramdisk source: the host already provides every tool; staging the host.'
+			else
+				for command_name in $missing; do
+					packages+=("$(host_tool_package "$command_name")")
+				done
+				printf 'Ramdisk source: installing the missing host tools with apt-get: %s\n' "${packages[*]}"
+				# The update is best-effort: a host may have a repository that is
+				# unreachable (an unsubscribed Proxmox host, for example) while the
+				# packages we need are still installable from the cached indexes.
+				DEBIAN_FRONTEND=noninteractive apt-get update || \
+					warn 'apt-get update failed; installing from the existing package indexes'
+				DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" || die 'apt-get install failed'
+			fi
+			RAMDISK_SOURCE=host
+			;;
+		*)
+			die "invalid --ramdisk-source: $RAMDISK_SOURCE (use auto, host, debian or apt)"
+			;;
+	esac
 }
 
 # stage_binary_into copies an executable and every shared library it needs into

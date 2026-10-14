@@ -38,11 +38,14 @@ Options:
                         the partition is extended to the end of the disk
   --kernel FILE         Kernel image loaded with kexec (default: /boot/vmlinuz-\$(uname -r))
   --ramdisk-source SRC  Where the deploy ramdisk userspace comes from:
-                        host (default): stage the running host's busybox and
-                        binaries; debian: fetch the Debian installer (d-i)
-                        netboot initrd plus the required .deb/.udeb packages
-                        over HTTP and assemble the ramdisk without the host
-                        package manager (for a non-apt source host)
+                        auto (default): stage the running host's tools when the
+                        host already has them all, otherwise download the Debian
+                        installer (d-i) components over HTTP;
+                        host: force the host tools, fail if any are missing;
+                        debian: force the HTTP download, needing no host package
+                        manager (for a non-apt source host such as Leap Micro);
+                        apt: install the missing host tools with apt-get, then
+                        stage the host (apt-based hosts only)
   --di-mirror URL       Debian mirror for the installer components
                         (default: http://deb.debian.org/debian)
   --di-suite NAME       Debian suite the installer components come from

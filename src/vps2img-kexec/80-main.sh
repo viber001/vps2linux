@@ -251,14 +251,14 @@ resolve_debian_packages() {
 # is needed, never the host package manager.
 extract_package_into() {
 	local archive=$1 destination=$2 member
-	member=$(ar t "$archive" | awk '/^data\.tar/{ print; exit }')
+	member=$(ar_command t "$archive" | awk '/^data\.tar/{ print; exit }')
 	[[ -n "$member" ]] || die "no data.tar member in $archive"
 	case "$member" in
-		*.tar.xz) ar p "$archive" "$member" | tar --no-same-owner -xJ -C "$destination" ;;
-		*.tar.zst) ar p "$archive" "$member" | tar --no-same-owner --zstd -x -C "$destination" ;;
-		*.tar.gz) ar p "$archive" "$member" | tar --no-same-owner -xz -C "$destination" ;;
-		*.tar.bz2) ar p "$archive" "$member" | tar --no-same-owner -xj -C "$destination" ;;
-		*.tar) ar p "$archive" "$member" | tar --no-same-owner -x -C "$destination" ;;
+		*.tar.xz) ar_command p "$archive" "$member" | tar --no-same-owner -xJ -C "$destination" ;;
+		*.tar.zst) ar_command p "$archive" "$member" | tar --no-same-owner --zstd -x -C "$destination" ;;
+		*.tar.gz) ar_command p "$archive" "$member" | tar --no-same-owner -xz -C "$destination" ;;
+		*.tar.bz2) ar_command p "$archive" "$member" | tar --no-same-owner -xj -C "$destination" ;;
+		*.tar) ar_command p "$archive" "$member" | tar --no-same-owner -x -C "$destination" ;;
 		*) die "unknown data.tar compression in $archive ($member)" ;;
 	esac
 }
@@ -560,10 +560,7 @@ parse_args() {
 main() {
 	parse_args "$@"
 	[[ $EUID -eq 0 ]] || die 'run as root'
-	case "$RAMDISK_SOURCE" in
-		host|debian) ;;
-		*) die "invalid --ramdisk-source: $RAMDISK_SOURCE (use host or debian)" ;;
-	esac
+	resolve_ramdisk_source
 	resolve_image_mode
 	check_dependencies
 	check_kexec_support
