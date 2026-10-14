@@ -182,6 +182,9 @@ def main():
     parser.add_argument('--dirs', nargs='+', required=True)
     parser.add_argument('--assets', nargs='+', default=[])
     parser.add_argument('--root', default='.')
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return 0
     args = parser.parse_args()
 
     builder = Builder(args.root)
