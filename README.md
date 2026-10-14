@@ -95,15 +95,15 @@ VPS2LEAPMICRO_CONFIRM=WIPE:/dev/sda \
 
 执行路径已在 VM 600 上端到端验证：`kexec -e` 后 initramfs 流式写入 image、重建 GPT 并创建直达磁盘末尾的 Combustion 分区（不留未分配空间，使 KIWI 首启跳过重分区），重启后由 `efibootmgr` 的 `vps2leapmicro` 启动项引导 Leap Micro；Combustion 首启生效（hostname、用户名/密码、静态 IP、`authorized_keys`），且首启后 Combustion 分区仍然存在、Btrfs 无损坏。VM 600/602 已在 Secure Boot 开启与关闭两种状态下验证通过。详见 `vps2leapmicro.md`。
 
-`vps2linux` 的 `pivot_root`（不使用 kexec）原理与研发测试过程见 `vps2linux.md`。
+### initramfs 用户态来源（`--ramdisk-source`）
 
-## vps2ins（实验性）
+部署 ramdisk 的用户态默认取自**运行中的宿主**（`host`）：打包宿主的 busybox、dropbear 等二进制与库，因此宿主需预装 `busybox`、`dropbear`、`sgdisk`（例如 Debian 上 `apt-get install -y kexec-tools dropbear busybox-static`）。kexec 始终加载**正在运行的内核**，所以替换的只是 ramdisk 用户态，内核与模块始终匹配。
 
-`vps2ins` 是 `vps2leapmicro` 的一个**实验性**变体，部署逻辑完全相同（kexec、流式写盘、GPT 重建、Combustion、扩容、EFI 启动项），唯一区别是 **initramfs 用户态来源**：它默认从 Debian 安装器（d-i）组件经普通 HTTP 获取并自行组装 ramdisk，不依赖宿主的包管理器，因此也能在**非 apt 源**（RHEL/openSUSE）上构建。
+在**非 apt 源**（RHEL/openSUSE 等）或不想预装工具的机器上，可用 `--ramdisk-source debian`：从 Debian 安装器（d-i）的 netboot initrd 与普通 `.deb/.udeb` 包经 HTTP 获取并自行组装 ramdisk，完全不经过宿主包管理器。`--di-mirror`（默认 `http://deb.debian.org/debian`）、`--di-suite`（默认 `stable`）、`--di-arch`（默认 `amd64`）选择 d-i 源。该路径已在 VM 602 上验证（构建时把 `apt`/`apt-get`/`dpkg`/`dpkg-deb` 全部移走，仍能组装并完成部署）。
 
 ```bash
-VPS2INS_CONFIRM=WIPE:/dev/sda \
-  ./vps2ins --execute \
+VPS2LEAPMICRO_CONFIRM=WIPE:/dev/sda \
+  ./vps2leapmicro --execute --ramdisk-source debian \
   --image-url 'http://10.68.247.224:18080/openSUSE-Leap-Micro.raw' \
   --sha256 "$RAW_IMAGE_SHA256" \
   --disk /dev/sda --hostname pve2-leap-test --interface vmbr0 \
@@ -112,7 +112,7 @@ VPS2INS_CONFIRM=WIPE:/dev/sda \
   --ssh-key-file /root/.ssh/authorized_keys --root-size-gib 100
 ```
 
-可用 `--ramdisk-source host` 切回 `vps2leapmicro` 的“打包宿主二进制”行为，`--di-mirror/--di-suite/--di-arch` 选择 d-i 源。该路径尚未定型，默认请用 `vps2leapmicro`。
+`vps2linux` 的 `pivot_root`（不使用 kexec）原理与研发测试过程见 `vps2linux.md`。
 
 ## 安全边界
 

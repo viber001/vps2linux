@@ -112,6 +112,6 @@ ISO 内的证据（`http://10.68.247.14:16000/eiso/id/3/`）：
 ## 已知限制
 
 - 需要关闭 Secure Boot 仅当你用 `--kernel` 指定了一个非当前运行的、未签名/未受信任的内核；默认加载当前运行内核时 Secure Boot 可保持开启（见上）。
-- 源系统需预装 `kexec-tools`、`dropbear`、`busybox-static`。
+- 源系统默认（`--ramdisk-source host`）需预装 `kexec-tools`、`dropbear`、`busybox-static`；`--ramdisk-source debian` 则从 d-i 组件经 HTTP 获取 ramdisk 用户态，无需宿主包管理器，适用于非 apt 源。
 - 驱动收集只在 virtio 与 Inspur 的网卡/磁盘路径上验证过，其他 AHCI/NVMe/RAID 控制器尚待在物理机验证。
 - 这是破坏性实验工具，默认只探测与 dry-run；目标盘必须有独立控制台、救援介质或可回滚快照。
