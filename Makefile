@@ -4,23 +4,26 @@
 # generated scripts are committed as well, so a plain `scp` still works without
 # running make.
 #
-# Every fragment carries a two-digit number and the merge order is ascending
-# numeric order, so the shared src/lib blocks slot in between the program
-# blocks: lib owns 10/30/50/70 and each program owns 00/20/40/60/80, no number
-# is used twice.  The recipe below sorts src/<program>/*.sh and src/lib/*.sh by
-# basename (field 3 of src/<dir>/<file>) to get that single merged order.
+# Every fragment carries a leading number and is merged in ascending numeric
+# order, so the shared src/lib blocks slot in between the program blocks: lib
+# owns 10/30/50/70 and each program owns 00/20/40/60/80, no number is used
+# twice.  tools/build.py also resolves the small directive language (see
+# docs/preprocessor.md) that lets a fragment pull a shared body -- such as the
+# Combustion script -- out of src/assets/ and substitute @KEY@ placeholders.
 SHELL := /bin/sh
 
-fragments = $(shell printf '%s\n' src/$(1)/*.sh src/lib/*.sh | sort -t/ -k3)
+sources = $(wildcard src/*/*.sh src/assets/*.txt tools/build.py)
 
 all: vps2img-pivot vps2img-kexec
 
-vps2img-pivot: $(call fragments,vps2img-pivot)
-	cat $^ > $@
+vps2img-pivot: $(sources)
+	python3 tools/build.py --program vps2img-pivot \
+		--dirs src/vps2img-pivot src/lib --assets src/assets > $@
 	chmod 0755 $@
 
-vps2img-kexec: $(call fragments,vps2img-kexec)
-	cat $^ > $@
+vps2img-kexec: $(sources)
+	python3 tools/build.py --program vps2img-kexec \
+		--dirs src/vps2img-kexec src/lib --assets src/assets > $@
 	chmod 0755 $@
 
 # Rebuild from the fragments and fail if the committed scripts are stale.

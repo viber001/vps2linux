@@ -8,6 +8,7 @@ set -Eeuo pipefail
 # running root filesystem must never write its own disk while that disk is
 # being replaced.
 
+(#@DEFINE@) PROGRAM=vps2img-pivot
 umask 077
 
 PROGRAM=${0##*/}

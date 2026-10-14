@@ -34,6 +34,7 @@ set -Eeuo pipefail
 # read-only plan, and writing requires both --execute and
 # VPS2IMG_KEXEC_CONFIRM=WIPE:<disk>.
 
+(#@DEFINE@) PROGRAM=vps2img-kexec
 umask 077
 
 PROGRAM=${0##*/}
