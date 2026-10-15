@@ -78,10 +78,16 @@ VPS2IMG_PIVOT_CONFIRM=WIPE:/dev/sda \
 
 - 内核需支持 kexec（`kexec_load` 自 Linux 2.6.13，`kexec_file_load` 自 3.17）：物理机、KVM/Xen/HN 可用，容器（OpenVZ/LXC）不可用。
 - 默认用 `kexec_file_load`（`kexec -s -l`）加载**当前正在运行的内核**，因此 **Secure Boot 可以保持开启**（lockdown 只禁止旧的 `kexec_load`）。仅当 `-s` 失败且系统未处于 lockdown 时才回退到 `kexec -c -l`；`--kernel` 指定未签名内核时仍需关闭 Secure Boot。
-- ramdisk 用户态默认 `--ramdisk-source auto`：宿主工具齐全时 staging 宿主，否则经 HTTP 下载 d-i 组件组装。宿主至少需要 `cpio`、`gzip`、`gdisk`/`sgdisk`（`--image-mode stream` 直接流式写 raw image，不需要 `squashfs-tools`）。详见下文。
+- ramdisk 用户态默认 `--ramdisk-source auto`：宿主工具齐全时 staging 宿主，否则经 HTTP 下载 d-i 组件组装。宿主至少需要 `cpio`、`gzip`、`gdisk`/`sgdisk`（`--image-mode stream` 直接流式写 raw image，不需要 `squashfs-tools`；`embed`/`disk` 对 SquashFS 源需要在宿主上有 `unsquashfs`）。详见下文。
 - initramfs 按整条设备链收集在用驱动模块（`lsmod` + 目标磁盘/网卡驱动闭包）和固件，以便在物理机上启动；内核内置的驱动自动跳过。
 
-默认 `--image-mode stream`：initramfs 保持极小（busybox + 少量工具，几 MB），raw image 通过 HTTP 直接流式写入目标盘（`wget -O - <url> | dd of=<disk> bs=4M`），任何时候都不把整块 image 放进 RAM；随后从目标盘回读前 `--image-size` 字节做 SHA-256 校验（未给出 `--image-size` 时用 HTTP `Content-Length` 推导）。`--image-mode embed` 把整块 image 内嵌进 initramfs，仅作为显式的非默认选项保留，非常耗内存。
+默认 `--image-mode auto`：源是 raw URL 时用 `stream`，否则（SquashFS 源）解压后按可用内存选择 `embed` 或 `disk`。
+
+- `stream`：initramfs 保持极小（busybox + 少量工具，几 MB），raw image 通过 HTTP 直接流式写入目标盘（`wget -O - <url> | dd of=<disk> bs=4M`），任何时候都不把整块 image 放进 RAM；随后从目标盘回读前 `--image-size` 字节做 SHA-256 校验（未给出 `--image-size` 时用 HTTP `Content-Length` 推导）。
+- `embed`：在原系统解压 SquashFS，把整块 raw image 内嵌进 initramfs（内存 staging，非常耗内存，需确保内存放得下 raw image）。
+- `disk`：在原系统解压 SquashFS，把 raw image 放到目标盘末尾的 ext4 scratch 区（盘尾空余空间内，不写 GPT 分区，用 loop 设备访问），initramfs 再从 scratch 拷回盘首写入。scratch 区位于 raw image 之上，写盘永远不会覆盖正在读取的 scratch；最终 deploy 会依据 raw image 重建 GPT，scratch 随之消失。压缩源始终先下载到磁盘，绝不落到内存。
+
+`--scratch-mib N` 可覆盖 `disk` 模式的 scratch 区大小（默认用最后一个分区之后的全部空余空间）。磁盘 mode 已在 VM 602（400G 盘、4G 内存）端到端验证：`auto` 正确选择 `disk`，重启后为 `pve2-leap-test`（root 64G btrfs、combustion 分区、静态网络、`leap` wheel sudo/SSH 全部生效，Btrfs 无错误）。
 
 Combustion 的 `/combustion/script` 会配置登录用户名、密码、SSH key、hostname、静态 IPv4/网关/DNS，并启用 `sshd` 和 `NetworkManager`。用户名通过 `--user` 指定（默认 `root`），密码通过 `--password` 指定（可选，设置后同时开启公钥和密码登录）。
 

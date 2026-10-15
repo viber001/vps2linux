@@ -18,7 +18,7 @@ exact VPS2IMG_KEXEC_CONFIRM value.
 
 Options:
   --image-url URL       Raw image URL (default: streamed to the target disk).
-                        A .squashfs URL cannot be streamed.
+                        A .squashfs URL needs disk or embed mode.
   --image-file FILE     Local raw image or SquashFS file (used with embed mode)
   --sha256 HASH         Expected SHA-256 of the raw image
   --image-size BYTES    Expected raw image size; auto-detected from the HTTP
@@ -51,9 +51,20 @@ Options:
   --di-suite NAME       Debian suite the installer components come from
                         (default: stable)
   --di-arch NAME        Debian architecture (default: amd64)
-  --image-mode MODE     auto (default), stream or embed.
-                        stream: fetch the raw image over HTTP into the disk;
-                        embed:  carry the image inside the initramfs (RAM-heavy)
+  --image-mode MODE     auto (default), stream, embed or disk.
+                        stream: fetch the raw image over HTTP straight to disk;
+                        embed:  unpack on the source, then carry the image inside
+                                the initramfs (RAM staging);
+                        disk:   unpack on the source, then stage the image on an
+                                ext4 scratch area at the end of the target disk
+                                and copy it back out from the initramfs;
+                        auto:   stream for a raw URL, otherwise embed when the
+                                free memory fits the image and disk when it does
+                                not.  The compressed source is always downloaded
+                                to disk first, never to RAM.
+  --scratch-mib N       Scratch area for disk mode, at the end of the target
+                        disk (default: all the free space after the last
+                        partition); must exceed the extracted raw image
   --execute             Load the initramfs with kexec and switch kernels
   --dry-run             Print the plan without staging or changing anything
   --stage-test          Build the initramfs, syntax-check its scripts and

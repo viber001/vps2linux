@@ -342,10 +342,12 @@ build_initramfs_debian() {
 	# one non-"lib"-named runtime dependency (dropbear and btrfs link it).
 	# The udebs give sfdisk (fdisk-udeb), mke2fs (e2fsprogs-udeb) and btrfs
 	# (btrfs-progs-udeb).  Shared-library dependencies are resolved recursively.
-	resolve_debian_packages \
-		util-linux coreutils mount bash libtinfo6 zlib1g gdisk efibootmgr \
-		kexec-tools kmod iproute2 dropbear-bin \
+	local -a debian_packages=(
+		util-linux coreutils mount bash libtinfo6 zlib1g gdisk efibootmgr
+		kexec-tools kmod iproute2 dropbear-bin
 		fdisk-udeb e2fsprogs-udeb btrfs-progs-udeb
+	)
+	resolve_debian_packages "${debian_packages[@]}"
 	stage_debian_packages
 	# Documentation and translations dominate the size of a full .deb
 	# extraction and no deploy tool reads them, so drop them to keep the
@@ -452,6 +454,8 @@ finalize_initramfs() {
 		printf 'IMAGE_RAW_URL=%q\n' "$IMAGE_RAW_URL"
 		printf 'IMAGE_SHA256=%q\n' "$IMAGE_SHA256"
 		printf 'IMAGE_SIZE=%q\n' "$IMAGE_SIZE"
+		printf 'SCRATCH_OFFSET=%q\n' "$SCRATCH_OFFSET"
+		printf 'SCRATCH_BYTES=%q\n' "$SCRATCH_BYTES"
 		printf 'DROPBEAR_BIN=%q\n' "$DROPBEAR_BIN"
 		printf 'DROPBEAR_KEY=%q\n' "$DROPBEAR_KEY"
 		printf 'TARGET_HOSTNAME=%q\n' "$TARGET_HOSTNAME"
@@ -548,6 +552,7 @@ parse_args() {
 			--di-suite) DI_SUITE=${2:?missing value for --di-suite}; shift 2 ;;
 			--di-arch) DI_ARCH=${2:?missing value for --di-arch}; shift 2 ;;
 			--image-mode) IMAGE_MODE_REQUEST=${2:?missing value for --image-mode}; shift 2 ;;
+			--scratch-mib) SCRATCH_MIB=${2:?missing value for --scratch-mib}; shift 2 ;;
 			--execute) EXECUTE=1; shift ;;
 			--dry-run) EXECUTE=0; shift ;;
 			--stage-test) EXECUTE=0; STAGE_TEST=1; shift ;;
@@ -588,6 +593,9 @@ main() {
 	[[ "${VPS2IMG_KEXEC_CONFIRM:-}" == "WIPE:$TARGET_DISK" ]] || \
 		die "set VPS2IMG_KEXEC_CONFIRM=WIPE:$TARGET_DISK to allow the destructive operation"
 	[[ "$SOURCE_DISK" == "$TARGET_DISK" ]] || warn 'target is not the current root disk; verify it before continuing'
+	if [[ "$IMAGE_MODE" == disk ]]; then
+		stage_image_on_disk
+	fi
 	ensure_host_kexec
 	build_initramfs
 	run_kexec

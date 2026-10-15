@@ -109,7 +109,8 @@ ISO 内的证据（`http://10.68.247.14:16000/eiso/id/3/`）：
 - VM 600 在 **Secure Boot 开启**（`mokutil --sb-state` = `SecureBoot enabled`，lockdown integrity）下：`--stage-test` 用 `kexec_file_load`（`-s`）加载 23.7 MiB initramfs 成功，完整 `--execute` 部署进入 Leap Micro 6.2，目标端 Secure Boot 仍为 enabled。
 - 物理机 c49（Inspur NS5488M5 节点，Debian 13 + PVE 源）：驱动按整条设备链收集，`eno2` 物理网卡上电，部署成功进入 Leap Micro。
 - 在 openSUSE Leap Micro 6.2 源（无可用的 `apt`、无 `ar`/binutils）上验证：`debian`（该源上 `auto` 也解析为它）经 HTTP 组装 ramdisk 后 `--execute` 部署成功，目标 `pve2-leap-test` 启动、静态网络/用户/密码/wheel sudo/SSH key 生效，Btrfs 无损坏；`--ramdisk-source apt` 在该源上按预期拒绝（无 `apt-get`）。`apt` 模式在 PVE Debian 源上（缺 `kexec-tools`）经 `apt-get` 补齐后按 host 模式构建成功。
-- Harvester 节点（Harvester v1.8.2 / SLES 16，root 是 loop 设备 `/dev/loop0`，backing file `/cOS/active.img` 落在 `COS_STATE` 分区）：`discover_source` 新增 loop-root 回退后，p123 / p126 的 `--dry-run` 均输出完整计划（`source root: /dev/loop0 (ext2)`、`source disk: /dev/sda`），stream 与 embed 两种镜像模式皆可用。PVE ext4+LVM、PVE/Leap Micro Btrfs 等非 loop 根不受影响。
+- Harvester 节点（Harvester v1.8.2 / SLES 16，root 是 loop 设备 `/dev/loop0`，backing file `/cOS/active.img` 落在 `COS_STATE` 分区）：`discover_source` 新增 loop-root 回退后，p123 / p126 的 `--dry-run` 均输出完整计划（`source root: /dev/loop0 (ext2)`、`source disk: /dev/sda`），并已 `--execute` 实测成功——两节点各自整盘覆盖为 Leap Micro 6.2（kernel 6.12.0-160000.35-default），保留原 IP，`leap` 用户 / wheel sudo / SSH key 生效，EFI `vps2img-kexec` 启动项建立，btrfs 无 error；镜像经 RAM 内网络从同网段的一台 Leap Micro 临时 HTTP 服务 stream。PVE ext4+LVM、PVE/Leap Micro Btrfs 等非 loop 根不受影响。
+- `--image-mode disk`（SquashFS 源，VM 602，400G 盘）：原始 OS 侧解压 SquashFS 到目标盘末尾新建的 ext4 scratch 区（loop 设备，不动 GPT），initramfs 从 scratch 拷回盘首写入。`--image-mode auto` 在 4G 内存的 VM 602 上因 raw image（3.55G）放不进内存而正确选择 `disk`；`--execute` 成功，重启进入 `pve2-leap-test`（root 64G btrfs、combustion 分区、静态网络、`leap` wheel sudo/SSH 全部生效，Btrfs 无 error）。`--image-mode embed` 在同一源上仍输出正确计划（3.55G raw 内嵌 initramfs）。scratch 区位于 raw image 之后，最终 deploy 依据 raw image 重建 GPT，scratch 消失。
 
 ## 已知限制
 

@@ -57,11 +57,31 @@ TARGET_PASSWORD=${VPS2IMG_KEXEC_PASSWORD:-}
 SSH_KEY_FILE=${VPS2IMG_KEXEC_SSH_KEY_FILE:-/root/.ssh/authorized_keys}
 ROOT_SIZE_GIB=${VPS2IMG_KEXEC_ROOT_SIZE_GIB:-64}
 CONFIG_SIZE_MIB=${VPS2IMG_KEXEC_CONFIG_SIZE_MIB:-1024}
+# --image-mode decides how the raw image reaches the target disk:
+#   stream  stream a raw image straight from an HTTP URL inside the initramfs;
+#   embed   unpack it on the source, then carry it inside the initramfs (this is
+#           the RAM staging: the image lives in RAM, so it needs enough memory);
+#   disk    unpack it on the source, then keep it on an ext4 scratch area at the
+#           very end of the target disk and copy it back out from the initramfs;
+#   auto    stream for a raw URL, otherwise embed when the free memory fits the
+#           extracted image and disk when it does not.
+# The compressed source is always downloaded to disk first (never to RAM).  For
+# disk mode the scratch area sits above the raw image, so the copy-back from the
+# head can never overwrite it.  SCRATCH_MIB overrides its size in MiB (0 = use
+# all the free space after the last partition).
+SCRATCH_MIB=${VPS2IMG_KEXEC_SCRATCH_MIB:-0}
 KEXEC_KERNEL=${VPS2IMG_KEXEC_KERNEL:-}
 IMAGE_MODE=
 IMAGE_RAW_URL=
 RAW_FILE=
 RAW_SIZE=
+# disk staging: SCRATCH_BYTES is the scratch area size and SCRATCH_OFFSET its
+# byte offset from the start of the target disk; the initramfs mounts a loop
+# device at that offset and copies image.raw out of its root.  DISK_RAW_SOURCE
+# is the extracted image on the source, moved onto the scratch area at execute.
+SCRATCH_BYTES=
+SCRATCH_OFFSET=
+DISK_RAW_SOURCE=
 DROPBEAR_KEY=
 DROPBEAR_BIN=
 KEXEC_BIN=

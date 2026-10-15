@@ -171,6 +171,9 @@ print_plan() {
 	printf 'target disk:     %s (%s bytes, %s)\n' "$TARGET_DISK" "$disk_bytes" "${model:-unknown model}"
 	if [[ "$IMAGE_MODE" == stream ]]; then
 		printf 'image source:    %s (streamed to disk, %s bytes)\n' "$IMAGE_RAW_URL" "$size_bytes"
+	elif [[ "$IMAGE_MODE" == disk ]]; then
+		printf 'image source:    %s (unpacked on the source, staged on a %s MiB scratch area at the end of the target disk)\n' \
+			"${IMAGE_URL:-$IMAGE_FILE}" "$(( ${SCRATCH_BYTES:-0} / 1048576 ))"
 	else
 		printf 'image source:    %s (embedded in initramfs, %s bytes)\n' "$RAW_FILE" "$size_bytes"
 	fi
@@ -212,8 +215,9 @@ check_dependencies() {
 			command -v "$command_name" >/dev/null 2>&1 || die "required command is missing: $command_name (install it, or use --ramdisk-source auto or debian to fetch the tools over HTTP)"
 		done
 	fi
-	# unsquashfs is only needed in embed mode when the source is an archive.
-	if [[ "$IMAGE_MODE" == embed ]]; then
+	# embed and disk both unpack a SquashFS archive on the source host; only
+	# stream copies a raw image straight through, so it needs neither.
+	if [[ "$IMAGE_MODE" != stream ]]; then
 		archive=${IMAGE_FILE:-$IMAGE_URL}
 		if [[ "$archive" != *.raw ]]; then
 			need_command unsquashfs
@@ -506,11 +510,61 @@ verify_image() {
 	log 'image checksum verified'
 }
 
+# write_image_disk copies the raw image out of the ext4 scratch area that the
+# source host staged at the very END of the target disk.  The area sits above
+# the image, so writing image.raw from the HEAD of the disk can never reach the
+# scratch area it reads from.  Nothing is downloaded here: the image is already
+# staged on the disk.
+write_image_disk() {
+	local loop scratch_bytes scratch_offset disk_bytes raw_path actual_size
+	scratch_bytes=${SCRATCH_BYTES:-0}
+	scratch_offset=${SCRATCH_OFFSET:-0}
+	if [ "$scratch_bytes" -le 0 ] || [ "$scratch_offset" -le 0 ]; then
+		log 'ERROR: disk mode needs a scratch area, but none was staged'
+		return 1
+	fi
+	disk_bytes=$(( $(blockdev --getsz "$DISK") * 512 ))
+	if [ $((scratch_offset + scratch_bytes)) -gt "$disk_bytes" ]; then
+		log "ERROR: the staged scratch area runs past the end of $DISK"
+		return 1
+	fi
+	loop=$(losetup --find --show --offset "$scratch_offset" "$DISK") || {
+		log 'ERROR: cannot create the scratch loop device'
+		return 1
+	}
+	mkdir -p /scratch
+	if ! mount -t ext4 "$loop" /scratch; then
+		log 'ERROR: cannot mount the staged scratch area'
+		losetup -d "$loop"
+		return 1
+	fi
+	raw_path=/scratch/image.raw
+	[ -s "$raw_path" ] || {
+		log 'ERROR: the staged scratch area has no image.raw'
+		umount /scratch
+		losetup -d "$loop"
+		return 1
+	}
+	actual_size=$(stat -c %s "$raw_path")
+	log "writing the staged image ($actual_size bytes) to $DISK"
+	if ! dd if="$raw_path" of="$DISK" bs=4M; then
+		log 'ERROR: writing the staged image to the disk failed'
+		umount /scratch
+		losetup -d "$loop"
+		return 1
+	fi
+	sync
+	umount /scratch
+	losetup -d "$loop"
+	return 0
+}
+
 # write_image streams the raw image straight to the disk (no RAM buffer) or, in
-# embed mode, copies the image carried inside this initramfs. It never buffers
-# the whole image in memory: the HTTP stream is piped into dd, so at most a few
-# megabytes are in flight. Page cache grows while streaming but is reclaimable
-# kernel memory, not an anonymous buffer holding the image.
+# embed mode, copies the image carried inside this initramfs, or in disk mode
+# stages it on the target disk. It never buffers the whole image in memory: the
+# HTTP stream is piped into dd, so at most a few megabytes are in flight. Page
+# cache grows while streaming but is reclaimable kernel memory, not an anonymous
+# buffer holding the image.
 write_image() {
 	local wget_rc dd_rc
 	if [ "${IMAGE_MODE:-stream}" = embed ]; then
@@ -519,6 +573,8 @@ write_image() {
 		if ! dd if=/image.raw of="$DISK" bs=4M; then
 			return 1
 		fi
+	elif [ "${IMAGE_MODE:-stream}" = disk ]; then
+		write_image_disk || return 1
 	else
 		[ -n "${IMAGE_RAW_URL:-}" ] || { log 'ERROR: no image URL for streaming'; return 1; }
 		log "streaming image to $DISK: $IMAGE_RAW_URL"
