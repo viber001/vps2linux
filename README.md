@@ -1,8 +1,11 @@
-# vps2img-pivot
+# vps2img-pivot / vps2img-kexec
 
-`vps2img-pivot` 是一个从正在运行的 Linux 系统部署另一套 Linux raw image 的实验工具。
+`vps2img-pivot` 与 `vps2img-kexec` 是两个从正在运行的 Linux 系统部署另一套 Linux raw image 到目标整盘的实验工具。
 
 当前目标是验证 openSUSE Leap Micro SelfInstall raw image 在 PVE/Debian 环境中的安全替换流程。
+
+- `vps2img-pivot`：用 `pivot_root` 离开旧系统，在 RAM-backed bootstrap 中写盘（旧系统仍存活，需要轻量缓解）。
+- `vps2img-kexec`：用 `kexec` 切换到新内核，由自制 initramfs 写盘（旧系统完全消失，推荐）。
 
 ## 使用背景
 
@@ -31,6 +34,26 @@ http://10.68.247.14:16000/eiso/id/3/
 - Leap Micro 的 KIWI 首启会把 root 分区扩到任意未分配空间，并在最后一个分区之后重建 `kiwi_RootPart`。如果 root 之后还留有空闲空间，首启就会搬走 root 分区、导致 root 文件系统失联（GRUB 报 `no such device`）。因此 Combustion 配置分区占据 root 之后的全部空间，使首启跳过重分区。
 - 配置分区使用 `combustion` 文件系统标签和 `/combustion/script`；脚本写入 hostname、NetworkManager 静态 IPv4、DNS、root `authorized_keys` 和 SSH 公钥登录配置。PVE 的 `vmbrX` 会先解析到 bridge member，并保存 member 的设备名、`altname` 和 MAC；目标系统优先按 MAC 匹配，其次按保存的名称匹配，最后回退到第一个 `UP` 的非 loopback 网卡。
 - PVE 单节点和 PVE 集群都只按普通 Debian/Linux root 环境检测，不修改 `/etc/pve` 集群配置。
+
+## 两个入口对比
+
+两个脚本都是破坏性、默认 dry-run 的整盘覆盖工具，区别在于如何脱离旧系统（详见文末各节）。
+
+| 维度 | `vps2img-pivot` | `vps2img-kexec`（推荐） |
+|---|---|---|
+| 脱离旧系统 | `pivot_root` 到 RAM tmpfs bootstrap | `kexec -e` 切换内核，由自制 initramfs 的 PID1 写盘 |
+| 旧内核 / systemd / Btrfs | 仍存活，需 `nodiscard` + `fsfreeze` + `blockdev --setro` + `umount -Rl` 压制回写 | `kexec -e` 后完全消失 |
+| 旧 root 回写目标盘风险 | 有（只能缓解） | 无 |
+| 镜像进入方式 | 整份 raw 复制进 RAM tmpfs | `stream` / `embed` / `disk`（见 `--image-mode`） |
+| RAM 需求 | raw 大小 + ~1 GiB | `stream` 极小；`embed` 需放得下 raw；`disk` 中等 |
+| `--image-mode` | 无 | `auto`（默认）/`stream`/`embed`/`disk` |
+| `--ramdisk-source` | 无 | `auto`（默认）/`host`/`debian`/`apt` |
+| Secure Boot | 不适用（不切换内核） | 默认 `kexec_file_load` 加载当前运行内核，可保持开启 |
+| 用户配置 | `--user`/`--password`（默认 root/空） | `--user`/`--password`（默认 root/空） |
+| 执行确认变量 | `VPS2IMG_PIVOT_CONFIRM=WIPE:<disk>` | `VPS2IMG_KEXEC_CONFIRM=WIPE:<disk>` |
+| 构建产物规模 | 约 0.9 千行 | 约 2.0 千行 |
+
+两者都需要 `--execute` 与各自的 `*_CONFIRM=WIPE:<disk>` 才能写盘，并共享 `src/lib/` 与 `src/assets/combustion-*.sh` 的公共代码。
 
 ## 当前用法
 
