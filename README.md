@@ -49,6 +49,7 @@ http://10.68.247.14:16000/eiso/id/3/
 | `--image-mode` | 无 | `auto`（默认）/`stream`/`embed`/`disk` |
 | `--ramdisk-source` | 无 | `auto`（默认）/`host`/`debian`/`apt` |
 | Secure Boot | 不适用（不切换内核） | 默认 `kexec_file_load` 加载当前运行内核，可保持开启 |
+| 部署期救援 SSH | 源装有 `dropbear` 时，bootstrap 接管 22 端口（kill 旧 sshd 后 dropbear 监听，仅 root 公钥） | initramfs 内置 dropbear，监听 22 端口（仅 root 公钥） |
 | 用户配置 | `--user`/`--password`（默认 root/空） | `--user`/`--password`（默认 root/空） |
 | 执行确认变量 | `VPS2IMG_PIVOT_CONFIRM=WIPE:<disk>` | `VPS2IMG_KEXEC_CONFIRM=WIPE:<disk>` |
 | 构建产物规模 | 约 0.9 千行 | 约 2.0 千行 |
@@ -93,6 +94,8 @@ VPS2IMG_PIVOT_CONFIRM=WIPE:/dev/sda \
 
 当前版本的执行路径已经在 VM 600 上验证：PVE `ext4+LVM` 可以从 RAM bootstrap 覆盖为 Leap Micro `EFI+Btrfs`，并通过 `efibootmgr` 创建 `vps2img-pivot` 启动项；Combustion 首启已验证静态 IP 和 SSH 公钥登录。VM 602 的 PVE `Btrfs` root 也已完成端到端验证（400 GiB 目标盘、root 100 GiB、Combustion 填满剩余空间），首启后 hostname、静态 IPv4、SSH 公钥均由 Combustion 生效。
 
+pivot 的旧系统在部署期间仍存活，旧 sshd 一直占着 22。若源系统装有 `dropbear`，RAM bootstrap 会 stage `dropbear`/`dropbearkey`、现场生成临时 host key，在冻结旧 PID1 后 `kill` 旧 sshd 并让 **dropbear 接管 22 端口**（仅 root 公钥登录，公钥即 `--ssh-key-file`），失败时 `rescue()` 保持 SSH 与串口 shell。未装 `dropbear` 时该功能整体跳过，控制通道仍是旧系统自身的 SSH。详见 `vps2img-pivot.md`。
+
 ## vps2img-kexec（kexec + 自制 initramfs，方案 2）
 
 `vps2img-kexec` 是独立的部署入口：在运行中的 Linux 源主机上构建一个最小 initramfs，用 `kexec` 切换到新内核，再由 initramfs 的 PID1 写入 raw image。与 `vps2img-pivot` 的 `pivot_root` 不同，旧内核、旧 systemd 和旧 Btrfs 在 `kexec -e` 后完全消失，旧 root 的 async discard / writeback 不再可能覆盖刚写入的目标盘。
@@ -103,6 +106,7 @@ VPS2IMG_PIVOT_CONFIRM=WIPE:/dev/sda \
 - 默认用 `kexec_file_load`（`kexec -s -l`）加载**当前正在运行的内核**，因此 **Secure Boot 可以保持开启**（lockdown 只禁止旧的 `kexec_load`）。仅当 `-s` 失败且系统未处于 lockdown 时才回退到 `kexec -c -l`；`--kernel` 指定未签名内核时仍需关闭 Secure Boot。
 - ramdisk 用户态默认 `--ramdisk-source auto`：宿主工具齐全时 staging 宿主，否则经 HTTP 下载 d-i 组件组装。宿主至少需要 `cpio`、`gzip`、`gdisk`/`sgdisk`（`--image-mode stream` 直接流式写 raw image，不需要 `squashfs-tools`；`embed`/`disk` 对 SquashFS 源需要在宿主上有 `unsquashfs`）。详见下文。
 - initramfs 按整条设备链收集在用驱动模块（`lsmod` + 目标磁盘/网卡驱动闭包）和固件，以便在物理机上启动；内核内置的驱动自动跳过。
+- initramfs 内置 **dropbear 救援 shell，监听 22 端口**：拉起网络后即启动（成功写盘前与失败路径都保留），仅允许 root 公钥登录（`--ssh-key-file`），host key 为构建时临时生成，故每次部署的指纹都不同。
 
 默认 `--image-mode auto`：源是 raw URL 时用 `stream`，否则（SquashFS 源）解压后按可用内存选择 `embed` 或 `disk`。
 
@@ -132,7 +136,7 @@ VPS2IMG_KEXEC_CONFIRM=WIPE:/dev/sda \
   --root-size-gib 40
 ```
 
-执行路径已在 VM 600 上端到端验证：`kexec -e` 后 initramfs 流式写入 image、重建 GPT 并创建直达磁盘末尾的 Combustion 分区（不留未分配空间，使 KIWI 首启跳过重分区），重启后由 `efibootmgr` 的 `vps2img-kexec` 启动项引导 Leap Micro；Combustion 首启生效（hostname、用户名/密码、静态 IP、`authorized_keys`），且首启后 Combustion 分区仍然存在、Btrfs 无损坏。VM 600/602 已在 Secure Boot 开启与关闭两种状态下验证通过。详见 `vps2img-kexec.md`。
+执行路径已在 VM 600 上端到端验证：`kexec -e` 后 initramfs 流式写入 image、重建 GPT 并创建直达磁盘末尾的 Combustion 分区（不留未分配空间，使 KIWI 首启跳过重分区），重启后由 `efibootmgr` 的 `vps2img-kexec` 启动项引导 Leap Micro；Combustion 首启生效（hostname、用户名/密码、静态 IP、`authorized_keys`），且首启后 Combustion 分区仍然存在、Btrfs 无损坏。VM 600/602 已在 Secure Boot 开启与关闭两种状态下验证通过。写盘阶段 initramfs 的 dropbear 救援 shell 在 22 端口可用（仅 root 公钥登录）。详见 `vps2img-kexec.md`。
 
 ### initramfs 用户态来源（`--ramdisk-source`）
 

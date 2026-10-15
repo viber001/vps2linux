@@ -137,6 +137,21 @@ run_from_bootstrap() {
 	# switched it read-only by blockdev --setro. It then detaches it before
 	# writing the new image.
 	export VPS2IMG_PIVOT_ROOT_SOURCE="$ROOT_SOURCE"
+	# When a rescue dropbear is staged, the inner deployer terminates the old
+	# sshd to free port 22, and this bootstrap shell shares that sshd's
+	# controlling terminal: detach first (ignore SIGHUP, move stdio to the
+	# console) so the deployer survives and owns the rescue loop.  Without a
+	# dropbear the operator's session is the only control channel, so it is
+	# left attached.
+	if [[ -n "${DROPBEAR_BIN:-}" ]]; then
+		trap '' HUP
+		for node in /dev/console /dev/ttyS0 /dev/tty0; do
+			if [[ -e "$node" ]]; then
+				exec <"$node" >"$node" 2>&1
+				break
+			fi
+		done
+	fi
 	# Run the deployer as a child so the RAM bootstrap shell remains available
 	# while the inner script freezes old userspace processes by name.
 	/usr/bin/bash /run/deploy "$TARGET_DISK"

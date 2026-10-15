@@ -152,13 +152,39 @@ stage_bootstrap() {
 
 	for command_name in bash mount umount mountpoint fsfreeze sync mkdir rm cp cat grep awk sed tr cut \
 		dd findmnt lsblk sha256sum sfdisk sgdisk blockdev stat losetup partx blkid \
-		lvchange vgchange chroot pivot_root reboot mkfs.ext4 chmod; do
+		lvchange vgchange chroot pivot_root reboot mkfs.ext4 chmod \
+		sleep; do
 		command_file=$(command_path "$command_name")
 		[[ -n "$command_file" ]] || die "cannot stage command: $command_name"
 		stage_binary "$command_file"
 	done
 	if command_file=$(command_path efibootmgr); then
 		stage_binary "$command_file"
+	fi
+	# Optional rescue SSH for the RAM bootstrap: after pivot_root the old sshd
+	# (and the operator's original session) is terminated and a dropbear takes
+	# over port 22.  Best-effort, so an image deploy still works on a source
+	# without the dropbear package.
+	DROPBEAR_BIN=
+	if command_file=$(command_path dropbear); then
+		DROPBEAR_BIN=$command_file
+		stage_binary "$command_file"
+		command_file=$(command_path dropbearkey)
+		[[ -n "$command_file" ]] || die 'dropbear is installed but dropbearkey is missing'
+		stage_binary "$command_file"
+		mkdir -p "$BOOTSTRAP/etc/dropbear" "$BOOTSTRAP/root/.ssh" "$BOOTSTRAP/bin"
+		dropbearkey -t ed25519 -f "$BOOTSTRAP/etc/dropbear/dropbear_ed25519_host_key" >/dev/null 2>&1 || \
+			die 'dropbearkey could not generate a rescue host key'
+		chmod 600 "$BOOTSTRAP/etc/dropbear/dropbear_ed25519_host_key"
+		cp -aL "$SSH_KEY_FILE" "$BOOTSTRAP/root/.ssh/authorized_keys"
+		chmod 600 "$BOOTSTRAP/root/.ssh/authorized_keys"
+		# Minimal account files and a shell so dropbear can resolve root and
+		# exec /bin/sh (a symlink to the staged bash).
+		printf 'root:x:0:0:root:/root:/bin/sh\n' > "$BOOTSTRAP/etc/passwd"
+		printf 'root:x:0:\n' > "$BOOTSTRAP/etc/group"
+		printf '/bin/sh\n' > "$BOOTSTRAP/etc/shells"
+		printf 'passwd: files\ngroup: files\n' > "$BOOTSTRAP/etc/nsswitch.conf"
+		ln -sf "$(command_path bash)" "$BOOTSTRAP/bin/sh"
 	fi
 	cp -a "$RAW_FILE" "$BOOTSTRAP/run/image.raw"
 	cp -aL "$SSH_KEY_FILE" "$BOOTSTRAP/run/authorized_keys"
@@ -174,6 +200,7 @@ TARGET_USER=$(printf '%q' "$TARGET_USER")
 TARGET_PASSWORD=$(printf '%q' "$TARGET_PASSWORD")
 ROOT_SIZE_GIB=$(printf '%q' "$ROOT_SIZE_GIB")
 CONFIG_SIZE_MIB=$(printf '%q' "$CONFIG_SIZE_MIB")
+DROPBEAR_BIN=$(printf '%q' "$DROPBEAR_BIN")
 EOF
 	cat > "$BOOTSTRAP/run/deploy" <<'INNER'
 #!/usr/bin/env bash
@@ -195,9 +222,91 @@ flush_disk() {
 	blockdev --flushbufs "$DISK" || fail "cannot flush pending writes for $DISK"
 }
 
+start_dropbear() {
+	local attempt key=
+	[[ -n "${DROPBEAR_BIN:-}" && -x "$DROPBEAR_BIN" ]] || {
+		printf '%s\n' 'WARNING: dropbear is unavailable; SSH rescue cannot start.' >&2
+		return 0
+	}
+	if [[ -r /etc/dropbear/dropbear_ed25519_host_key ]]; then
+		key=/etc/dropbear/dropbear_ed25519_host_key
+	fi
+	# The old sshd's listening socket may linger for a moment after it is
+	# terminated, so retry the bind before giving up.
+	for attempt in 1 2 3 4 5 6 7 8 9 10; do
+		if [[ -n "$key" ]]; then
+			"$DROPBEAR_BIN" -s -r "$key" -p 22 -P /run/dropbear.pid >/dev/null 2>&1 && return 0
+		else
+			"$DROPBEAR_BIN" -s -p 22 -P /run/dropbear.pid >/dev/null 2>&1 && return 0
+		fi
+		sleep 1
+	done
+	printf '%s\n' 'WARNING: dropbear failed to bind port 22.' >&2
+}
+
+# The RAM bootstrap inherits the operator's SSH session from the old system, and
+# the old sshd keeps running after pivot_root (the old init is only frozen, not
+# killed).  Two problems follow: the port-22 socket is held by the old sshd, and
+# that session's interactive shell plus the old systemd keep writing the old
+# root, which lives on the very disk being overwritten.  Kill the old sshd, but
+# first detach our own stdio to the console and ignore SIGHUP: killing the
+# session's sshd closes its pty, and without this the deployer would be hung up
+# with it.
+detach_and_takeover_console() {
+	trap '' HUP
+	for tty in /dev/console /dev/ttyS0 /dev/tty0; do
+		[[ -e "$tty" ]] || continue
+		exec <"$tty" >"$tty" 2>&1
+		break
+	done
+}
+
+kill_old_sshd() {
+	local proc pid comm
+	for proc in /proc/[0-9]*; do
+		pid=${proc##*/}
+		[[ -r "$proc/comm" ]] || continue
+		comm=$(<"$proc/comm")
+		[[ "$comm" == sshd ]] || continue
+		kill -TERM "$pid" 2>/dev/null || true
+	done
+}
+
+rescue() {
+	local tty shell
+	printf '%s\n' 'RESCUE: automatic deploy did not finish; staying alive.' >&2
+	printf '%s\n' 'RESCUE: SSH (dropbear, root pubkey) is available on port 22.' >&2
+	printf '%s\n' 'RESCUE: a console shell is attached below as well.' >&2
+	shell=/bin/sh
+	[[ -x /bin/bash ]] && shell=/bin/bash
+	for tty in /dev/tty0 /dev/ttyS0; do
+		[[ -e "$tty" ]] || continue
+		"$shell" -i <"$tty" >"$tty" 2>&1 &
+	done
+	while :; do
+		if [[ -f /run/dropbear.pid ]] && kill -0 "$(< /run/dropbear.pid)" 2>/dev/null; then
+			:
+		else
+			start_dropbear
+		fi
+		sleep 30
+	done
+}
+
 printf '%s\n' '=== VPS2IMG_PIVOT RAM DEPLOYMENT ==='
 [[ "$(lsblk -dnro TYPE "$DISK")" == disk ]] || fail "not a whole disk: $DISK"
 [[ -s "$RAW" ]] || fail 'raw image is missing from the RAM bootstrap'
+# On any later failure keep the machine alive instead of exitting into a frozen
+# old init: enter rescue(), which restarts dropbear (if it was staged) and
+# attaches console shells.
+trap 'printf "%s\n" "vps2img-pivot deployer exiting rc=$?" >&2; rescue' EXIT
+# Take over from the old system before anything destroys the target disk: move
+# our stdio off the dying SSH session now.  The old sshd itself is terminated
+# only after PID1 is frozen below, so a still-running systemd cannot respawn it
+# on port 22 before the rescue dropbear binds.
+if [[ -n "${DROPBEAR_BIN:-}" ]]; then
+	detach_and_takeover_console
+fi
 flush_disk
 
 # Stop writes from the old LVM-backed root before pivoting away from it.
@@ -230,6 +339,14 @@ for proc in /proc/[0-9]*; do
 	esac
 done
 printf '%s\n' 'Old userspace frozen; continuing with target disk replacement.'
+
+# PID1 is frozen now, so the old sshd cannot be respawned: terminate it and take
+# over port 22 with the rescue dropbear.  Without a staged dropbear the old sshd
+# (and the operator's original session) is deliberately left running.
+if [[ -n "${DROPBEAR_BIN:-}" ]]; then
+	kill_old_sshd
+	start_dropbear
+fi
 
 # The old root is still mounted below /oldroot after pivot_root. Before the
 # disk is touched, stop the two things that can still reach it after dd:

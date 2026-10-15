@@ -29,6 +29,9 @@
                  ▼
 RAM bootstrap 内层部署
 ┌──────────────────────────────────────┐
+│ 脱离旧 SSH 会话（stdio 转控制台）      │
+│ SIGSTOP 冻结旧 PID1/服务              │
+│ kill 旧 sshd；dropbear 接管 22 端口    │
 │ 禁用旧 root async discard (nodiscard) │
 │ flush_disk；fsfreeze 冻结旧 root      │
 │ blockdev --setro；umount -Rl /oldroot  │
@@ -40,6 +43,21 @@ RAM bootstrap 内层部署
 │ flush 后 reboot -f                     │
 └──────────────────────────────────────┘
 ```
+
+## 救援 SSH（dropbear 监听 22）
+
+与 `vps2img-kexec` 一致，pivot 也能在部署期提供监听 22 的 dropbear 救援 shell，但两者的前提不同：
+
+- kexec 在 `kexec -e` 后旧内核/旧 sshd 已消失，22 端口天然空闲。
+- pivot 的旧系统仍然存活，**旧 sshd 一直占着 22**；`pivot_root` 只切挂载命名空间，不会终止它。
+
+因此 pivot 的流程是：当源系统装有 `dropbear`（`dropbear` + `dropbearkey`）时，构建 bootstrap 会 stage 它们、现场生成临时 host key，并把 `--ssh-key-file` 拷进 `root/.ssh/authorized_keys`。进入 RAM bootstrap 后：
+
+1. `detach_and_takeover_console`：把 bootstrap 与外层 shell 的 stdio 切到 `/dev/console`、`/dev/ttyS0`、`/dev/tty0` 并 `trap '' HUP`，**先脱离旧 SSH 会话的 pty**——否则后面 kill 旧 sshd 会连带 SIGHUP 掉部署器自身。
+2. `SIGSTOP` 冻结旧 PID1 后，`kill -TERM` 旧 sshd，再 `start_dropbear` 起来接 22（`-s` 仅公钥登录，`-r` 用临时 host key；旧 sshd 的监听 socket 可能短暂残留，故带重试）。
+3. `trap ... EXIT` 进入 `rescue()`：重启 dropbear 并在控制台开 shell，写盘失败也不退出。
+
+未安装 `dropbear` 时整段跳过，旧 sshd 与操作员会话原样保留（此时控制通道仍是旧系统的 SSH）。这与 kexec 的“仅 root 公钥、host key 构建期临时生成”保持一致的语义。
 
 目标首启由镜像自带引导程序启动，dracut 的 `35combustion` 按 label `combustion` 找到配置分区并执行 `/combustion/script`。这与 `vps2img-kexec` 完全一致（见 `vps2img-kexec.md`）。
 

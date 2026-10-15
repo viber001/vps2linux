@@ -20,7 +20,9 @@ Options:
   --user NAME           Login user created by Combustion (default: root)
   --password VALUE      Password for --user; when set, password SSH login is
                         enabled as well as the SSH key
-  --ssh-key-file FILE   authorized_keys source (default: /root/.ssh/authorized_keys)
+  --ssh-key-file FILE   authorized_keys source (default: /root/.ssh/authorized_keys);
+                        when dropbear is installed on the source, the RAM bootstrap
+                        serves this key over a rescue SSH on port 22
   --root-size-gib N     Btrfs partition size (default: 64)
   --config-size-mib N   Minimum Combustion partition size (default: 1024);
                         the partition is extended to the end of the disk

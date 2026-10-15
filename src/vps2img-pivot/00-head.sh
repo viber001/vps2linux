@@ -33,4 +33,5 @@ RAW_FILE=
 ROOT_SOURCE=
 SOURCE_DISK=
 BOOTSTRAP=/run/vps2img-pivot-bootstrap
+DROPBEAR_BIN=
 

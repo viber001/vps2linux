@@ -39,6 +39,15 @@
 5. 把 root 分区 `btrfs filesystem resize max` 扩到 `--root-size-gib`。
 6. `efibootmgr` 创建 EFI 启动项，`flush_disk` 后 `reboot -f`。
 
+### 阶段 B 附：救援 SSH（dropbear 监听 22）
+
+initramfs 里旧内核、旧 systemd、旧 sshd 已随 `kexec -e` 完全消失，因此 22 端口是空闲的。`/init` 在 `bring_up_network` 之后拉起一个 **dropbear 救援 shell，监听 22 端口**：
+
+- 仅允许 **root 公钥**登录（`dropbear -s -r <host key> -p 22`，`-s` 关闭密码登录），公钥就是 `--ssh-key-file`（`root/.ssh/authorized_keys`）；
+- host key 是构建 initramfs 时用 `dropbearkey` 现场生成的**临时密钥**，每次部署都不同；
+- dropbear 由 PID1 以守护进程方式拉起，**成功路径（写盘前）和失败路径都会监听**：`/init` 的 `trap ... EXIT` 进入 `rescue()` 时会重启 dropbear 并打印 `RESCUE: SSH (dropbear, root pubkey) is available on port 22`，然后在 `/dev/tty0`、`/dev/ttyS0` 上循环开 shell，即使写盘中途失败也留有远程入口；
+- `--dry-run`/`--stage-test` 也会构建含 dropbear 的 initramfs，可用 `--stage-test` 后核对。
+
 ### 阶段 C：目标首启
 
 重启后由 sda 上镜像自己的引导程序（shim → grub → 镜像内核）启动；dracut 的 `35combustion` 模块按分区 label `combustion` 找到配置分区，挂载并执行 `/combustion/script`，完成 hostname、静态网络、用户名/密码、SSH key 与 sudo 配置。
@@ -52,7 +61,7 @@
   - 目标磁盘、网卡的**整条设备链**对应模块（走 `driver` 的 `module` 符号链接，跳过 builtin）；
   - 对 bridge/bond 网卡跟随到有 `/device` 的 member；
   - 每个模块带上 `modprobe --show-depends` 的依赖闭包。
-- 可选 `dropbear`（initramfs 内提供 SSH 以便调试）。
+- `dropbear`（initramfs 内提供 SSH 以便调试）：PID1 在拉起网络后即启动，**监听 22 端口、仅 root 公钥登录**，成功和失败路径都保留这个救援入口（见上）。
 
 ## 目标磁盘布局
 
@@ -111,6 +120,7 @@ ISO 内的证据（`http://10.68.247.14:16000/eiso/id/3/`）：
 - 在 openSUSE Leap Micro 6.2 源（无可用的 `apt`、无 `ar`/binutils）上验证：`debian`（该源上 `auto` 也解析为它）经 HTTP 组装 ramdisk 后 `--execute` 部署成功，目标 `pve2-leap-test` 启动、静态网络/用户/密码/wheel sudo/SSH key 生效，Btrfs 无损坏；`--ramdisk-source apt` 在该源上按预期拒绝（无 `apt-get`）。`apt` 模式在 PVE Debian 源上（缺 `kexec-tools`）经 `apt-get` 补齐后按 host 模式构建成功。
 - Harvester 节点（Harvester v1.8.2 / SLES 16，root 是 loop 设备 `/dev/loop0`，backing file `/cOS/active.img` 落在 `COS_STATE` 分区）：`discover_source` 新增 loop-root 回退后，p123 / p126 的 `--dry-run` 均输出完整计划（`source root: /dev/loop0 (ext2)`、`source disk: /dev/sda`），并已 `--execute` 实测成功——两节点各自整盘覆盖为 Leap Micro 6.2（kernel 6.12.0-160000.35-default），保留原 IP，`leap` 用户 / wheel sudo / SSH key 生效，EFI `vps2img-kexec` 启动项建立，btrfs 无 error；镜像经 RAM 内网络从同网段的一台 Leap Micro 临时 HTTP 服务 stream。PVE ext4+LVM、PVE/Leap Micro Btrfs 等非 loop 根不受影响。
 - `--image-mode disk`（SquashFS 源，VM 602，400G 盘）：原始 OS 侧解压 SquashFS 到目标盘末尾新建的 ext4 scratch 区（loop 设备，不动 GPT），initramfs 从 scratch 拷回盘首写入。`--image-mode auto` 在 4G 内存的 VM 602 上因 raw image（3.55G）放不进内存而正确选择 `disk`；`--execute` 成功，重启进入 `pve2-leap-test`（root 64G btrfs、combustion 分区、静态网络、`leap` wheel sudo/SSH 全部生效，Btrfs 无 error）。`--image-mode embed` 在同一源上仍输出正确计划（3.55G raw 内嵌 initramfs）。scratch 区位于 raw image 之后，最终 deploy 依据 raw image 重建 GPT，scratch 消失。
+- 救援 SSH：initramfs 的 dropbear 在**重启前的写盘阶段即监听 22**，仅 root 公钥登录（`--ssh-key-file`），host key 为构建期临时生成。VM 600（ext4+LVM 源）与 VM 602（Btrfs 源）的 `--execute` 过程中该端口均可用，写盘失败时 `rescue()` 保持 22 与串口 shell 不退出。
 
 ## 已知限制
 
