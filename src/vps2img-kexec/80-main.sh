@@ -66,27 +66,42 @@ fetch_debian_index() {
 # Debian field continuation lines (which start with a space) are ignored, which
 # is safe because in practice only Description/Tag wrap.
 di_parse_index() {
-	local dist=$1 file=$2 name filename dependencies sha256 key
+	local dist=$1 file=$2 name filename dependencies sha256 key empty_field
+	empty_field=__VPS2IMG_EMPTY_FIELD__
 	[[ -n "${DI_INDEX_PARSED[$dist]:-}" ]] && return 0
 	DI_INDEX_PARSED[$dist]=1
 	while IFS=$'\t' read -r name filename dependencies sha256; do
 		[[ -n "$name" && -n "$filename" ]] || continue
+		[[ "$dependencies" == "$empty_field" ]] && dependencies=
+		[[ "$sha256" == "$empty_field" ]] && sha256=
 		key=$dist/$name
 		DI_PKG_FILE[$key]=$filename
 		DI_PKG_DEP[$key]=$dependencies
 		DI_PKG_SHA256[$key]=$sha256
 		DI_PKG_DISTS[$name]="${DI_PKG_DISTS[$name]:-}${DI_PKG_DISTS[$name]:+ }$dist"
-	done < <(awk -v dist="$dist" '
-		/^Package: /{ name=substr($0,10) }
-		/^Filename: /{ filename=substr($0,11) }
-		/^SHA256:/ {
-			sha256=$0
-			sub(/^SHA256:[[:space:]]*/, "", sha256)
+	done < <(awk -v dist="$dist" -v empty="$empty_field" '
+		function serialized(value) {
+			return value == "" ? empty : value
 		}
-		/^Depends: /{ dependencies=dependencies (dependencies?" ":"") substr($0,10) }
-		/^Pre-Depends: /{ dependencies=dependencies (dependencies?" ":"") substr($0,13) }
-		/^$/{ if(name!=""){ print name "\t" filename "\t" dependencies "\t" sha256 } name="";filename="";dependencies="";sha256="" }
-		END{ if(name!=""){ print name "\t" filename "\t" dependencies "\t" sha256 } }
+		function field_value(line) {
+			sub(/^[^:]*:[[:space:]]*/, "", line)
+			return line
+		}
+		/^Package:/ { name=field_value($0) }
+		/^Filename:/ { filename=field_value($0) }
+		/^SHA256:/ {
+			sha256=field_value($0)
+		}
+		/^Depends:/ {
+			value=field_value($0)
+			dependencies=dependencies (dependencies?" ":"") value
+		}
+		/^Pre-Depends:/ {
+			value=field_value($0)
+			dependencies=dependencies (dependencies?" ":"") value
+		}
+		/^$/{ if(name!=""){ print name "\t" filename "\t" serialized(dependencies) "\t" serialized(sha256) } name="";filename="";dependencies="";sha256="" }
+		END{ if(name!=""){ print name "\t" filename "\t" serialized(dependencies) "\t" serialized(sha256) } }
 	' "$file")
 }
 
