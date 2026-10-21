@@ -11,3 +11,12 @@ table_field() {
 			exit
 		}
 	}')
+	printf '%s\n' "$value"
+}
+
+partition_path() {
+	case "$1" in
+		/dev/nvme*|/dev/mmcblk*|/dev/loop*) printf '%sp%s\n' "$1" "$2" ;;
+		*) printf '%s%s\n' "$1" "$2" ;;
+	esac
+}

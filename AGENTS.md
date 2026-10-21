@@ -12,16 +12,16 @@
 两个入口脚本是**构建产物**，由 `src/` 下的小片段合并而成，共享代码只存一份：
 
 ```text
-src/lib/           共享片段（die/warn、路径、源探测、GPT 解析）
+src/lib/           共享片段（die/warn、路径与 stage_binary、源探测）
 src/vps2img-pivot/ pivot 专属片段
 src/vps2img-kexec/ kexec 专属片段
-src/assets/        仅被指令引用的正文（如 Combustion 脚本）
+src/assets/        仅被指令引用的正文（Combustion、内层 deploy 公共段、plan 字段）
 tools/build.py     片段预处理器（仅标准库）
 Makefile           make / make check
 docs/preprocessor.md  指令语言参考
 ```
 
-片段带前导编号，按编号升序合并（lib 占 10/30/50/70，程序占 00/20/40/60/80，编号不重叠）。`tools/build.py` 还解析一套小型指令语言，让片段能把 `src/assets/` 里的共享正文（尤其 heredoc 正文）拉进来并替换 `@KEY@` 占位符。指令前缀以 `(` 开头（如 `(#@HEREDOC@expand) …`），是**未替换即语法报错**的绊线，防止把未构建的片段当脚本执行。
+片段带前导编号，按编号升序合并（lib 占 10/30/50，程序占 00/20/40/60/80，编号不重叠）。`tools/build.py` 还解析一套小型指令语言，让片段能把 `src/assets/` 里的共享正文（尤其 heredoc 正文）拉进来并替换 `@KEY@` 占位符。指令前缀以 `(` 开头（如 `(#@HEREDOC@expand) …`），是**未替换即语法报错**的绊线，防止把未构建的片段当脚本执行。
 
 常用命令：
 

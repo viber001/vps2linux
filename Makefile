@@ -6,7 +6,7 @@
 #
 # Every fragment carries a leading number and is merged in ascending numeric
 # order, so the shared src/lib blocks slot in between the program blocks: lib
-# owns 10/30/50/70 and each program owns 00/20/40/60/80, no number is used
+# owns 10/30/50 and each program owns 00/20/40/60/80, no number is used
 # twice.  tools/build.py also resolves the small directive language (see
 # docs/preprocessor.md) that lets a fragment pull a shared body -- such as the
 # Combustion script -- out of src/assets/ and substitute @KEY@ placeholders.

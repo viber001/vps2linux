@@ -1,103 +1,23 @@
-	printf '%s\n' "$value"
-}
-RAW_P1_START=$(table_field "$RAW_P1_LINE" start)
-RAW_P1_SIZE=$(table_field "$RAW_P1_LINE" size)
-RAW_P1_TYPE=$(table_field "$RAW_P1_LINE" type)
-RAW_P1_UUID=$(table_field "$RAW_P1_LINE" uuid)
-RAW_P2_START=$(table_field "$RAW_P2_LINE" start)
-RAW_P2_SIZE=$(table_field "$RAW_P2_LINE" size)
-RAW_P2_TYPE=$(table_field "$RAW_P2_LINE" type)
-RAW_P2_UUID=$(table_field "$RAW_P2_LINE" uuid)
-RAW_ROOT_START=$(table_field "$RAW_P3_LINE" start)
-RAW_P3_TYPE=$(table_field "$RAW_P3_LINE" type)
-RAW_P3_UUID=$(table_field "$RAW_P3_LINE" uuid)
-[[ "$SECTOR_SIZE" =~ ^[0-9]+$ && "$RAW_ROOT_START" =~ ^[0-9]+$ ]] || fail 'cannot calculate the Combustion partition offset'
-[[ -n "$RAW_DISK_GUID" && -n "$RAW_P1_START" && -n "$RAW_P1_SIZE" && -n "$RAW_P1_TYPE" && -n "$RAW_P1_UUID" && \
-	-n "$RAW_P2_START" && -n "$RAW_P2_SIZE" && -n "$RAW_P2_TYPE" && -n "$RAW_P2_UUID" && \
-	-n "$RAW_P3_TYPE" && -n "$RAW_P3_UUID" ]] || fail 'cannot read the raw image GPT metadata'
-ROOT_SIZE_SECTORS=$((ROOT_SIZE_GIB * 1024 * 1024 * 1024 / SECTOR_SIZE))
-ALIGN_SECTORS=$((1048576 / SECTOR_SIZE))
-CONFIG_START=$((RAW_ROOT_START + ROOT_SIZE_SECTORS))
-CONFIG_START=$(((CONFIG_START + ALIGN_SECTORS - 1) / ALIGN_SECTORS * ALIGN_SECTORS))
-	# openSUSE Leap Micro and other KIWI SelfInstall images grow the root
-	# partition to fill any unpartitioned space on the first boot and recreate
-	# kiwi_RootPart immediately after the last partition.  That would move our
-	# root partition and orphan the root filesystem.  Extend the Combustion
-	# partition to the end of the disk so no free space remains and the image's
-	# first-boot repartitioning is skipped.
-	CONFIG_SIZE=$((DISK_SECTORS - 34 - CONFIG_START))
-	(( CONFIG_SIZE >= CONFIG_SIZE_MIB * 1024 * 1024 / SECTOR_SIZE )) || \
-		fail 'not enough free space for the Combustion partition'
-	CONFIG_END=$((CONFIG_START + CONFIG_SIZE - 1))
-case "$DISK" in
-	/dev/nvme*|/dev/mmcblk*|/dev/loop*) CONFIG_PART=${DISK}p4 ;;
-	*) CONFIG_PART=${DISK}4 ;;
-esac
-# The old kernel partition devices can survive dd and keep sfdisk from
-# replacing an in-use partition entry. Remove those stale mappings before
-# writing the new on-disk GPT with sgdisk.
-partx -d "$DISK" 2>/dev/null || true
-sgdisk --zap-all "$DISK"
-sgdisk \
-	--disk-guid="$RAW_DISK_GUID" \
-	--new=1:"$RAW_P1_START":"$((RAW_P1_START + RAW_P1_SIZE - 1))" \
-	--typecode=1:"$RAW_P1_TYPE" --partition-guid=1:"$RAW_P1_UUID" --change-name=1:p.legacy \
-	--new=2:"$RAW_P2_START":"$((RAW_P2_START + RAW_P2_SIZE - 1))" \
-	--typecode=2:"$RAW_P2_TYPE" --partition-guid=2:"$RAW_P2_UUID" --change-name=2:p.UEFI \
-	--new=3:"$RAW_ROOT_START":"$((RAW_ROOT_START + ROOT_SIZE_SECTORS - 1))" \
-	--typecode=3:"$RAW_P3_TYPE" --partition-guid=3:"$RAW_P3_UUID" --change-name=3:p.lxroot \
-	--new=4:"$CONFIG_START":"$CONFIG_END" \
-	--typecode=4:0FC63DAF-8483-4772-8E79-3D69D8477DE4 --change-name=4:combustion \
-	"$DISK"
-sync
-sgdisk --verify "$DISK" || fail "the target GPT failed verification: $DISK"
-ACTUAL_ROOT=$(sfdisk --dump "$DISK" | awk -v part="${DISK}3" '$1 == part { gsub(/,/, "", $4); gsub(/,/, "", $6); print $4 " " $6; exit }')
-[[ "$ACTUAL_ROOT" == "$RAW_ROOT_START $ROOT_SIZE_SECTORS" ]] || \
-	fail "target GPT root partition mismatch: expected $RAW_ROOT_START/$ROOT_SIZE_SECTORS, got ${ACTUAL_ROOT:-missing}"
+(#@INCLUDE@expand) src/assets/deploy-lib.sh
+GPT_SOURCE=$RAW
+(#@INCLUDE@expand) src/assets/deploy-gpt.sh
+(#@INCLUDE@expand) src/assets/deploy-combustion.sh
 
-CONFIG_OFFSET=$((CONFIG_START * SECTOR_SIZE))
-CONFIG_BYTES=$((CONFIG_SIZE * SECTOR_SIZE))
-CONFIG_LOOP=$(losetup --find --show --offset "$CONFIG_OFFSET" --sizelimit "$CONFIG_BYTES" "$DISK") || \
-	fail 'cannot create a loop device for the Combustion partition'
-cleanup_config() {
-	umount /run/config 2>/dev/null || true
-	losetup -d "$CONFIG_LOOP" 2>/dev/null || true
-}
-trap cleanup_config EXIT
-mkfs.ext4 -F -L combustion "$CONFIG_LOOP"
-mkdir -p /run/config
-mount "$CONFIG_LOOP" /run/config
-mkdir -p /run/config/combustion
-# sshd policy: password authentication is enabled only when a password was
-# requested, and root password login only when the requested user is root.
-SSHD_PASSWORD_AUTH=no
-SSHD_ROOT_LOGIN=prohibit-password
-if [[ -n "$TARGET_PASSWORD" ]]; then
-	SSHD_PASSWORD_AUTH=yes
-	[[ "$TARGET_USER" != root ]] || SSHD_ROOT_LOGIN=yes
-fi
-
-(#@HEREDOC@expand) cat > /run/config/combustion/script <<COMBUSTION | src/assets/combustion-pivot.sh
-chmod 0700 /run/config/combustion/script
+(#@HEREDOC@expand) cat > /config/combustion/script <<COMBUSTION | src/assets/combustion.sh
+chmod 0700 /config/combustion/script
 sync
-umount /run/config
+umount /config
 losetup -d "$CONFIG_LOOP"
 trap - EXIT
 
-# The image also has EFI/BOOT/BOOTX64.EFI, but an explicit NVRAM entry avoids
-# depending on firmware fallback behavior after replacing a previous OS.
-partx -u "$DISK" 2>/dev/null || true
-if [[ -d /sys/firmware/efi ]]; then
-	command -v efibootmgr >/dev/null 2>&1 || fail 'UEFI boot detected but efibootmgr is not staged'
-	efibootmgr -c -d "$DISK" -p 2 -L 'vps2img-pivot' -l '\EFI\BOOT\BOOTX64.EFI' || \
-		fail 'efibootmgr could not create the vps2img-pivot boot entry'
-	efibootmgr -v || fail 'efibootmgr could not read the new boot entry'
-else
-	printf '%s\n' 'UEFI runtime unavailable; relying on the EFI fallback path or BIOS boot code.'
-fi
-	flush_disk
-	printf '%s\n' 'Raw image written. Rebooting into the new system.'
-reboot -f
+# The old kernel still has the former root's btrfs superblock registered, so a
+# post-dd mount would rejoin that stale superblock instead of the new image.
+# Leave the resize to the Combustion script on the target.
+GROW_ROOT_IN_RAM=no
+(#@INCLUDE@expand) src/assets/deploy-growroot.sh
+(#@INCLUDE@expand) src/assets/deploy-efi.sh
+flush_disk
+(#@INCLUDE@expand) src/assets/deploy-reboot.sh
 INNER
 	chmod 0755 "$BOOTSTRAP/run/deploy"
 }
@@ -176,6 +96,7 @@ parse_args() {
 			--ssh-key-file) SSH_KEY_FILE=${2:?missing value for --ssh-key-file}; shift 2 ;;
 			--root-size-gib) ROOT_SIZE_GIB=${2:?missing value for --root-size-gib}; shift 2 ;;
 			--config-size-mib) CONFIG_SIZE_MIB=${2:?missing value for --config-size-mib}; shift 2 ;;
+			--reboot-delay) REBOOT_DELAY=${2:?missing value for --reboot-delay}; shift 2 ;;
 			--execute) EXECUTE=1; shift ;;
 			--dry-run) EXECUTE=0; shift ;;
 			--stage-test) EXECUTE=0; STAGE_TEST=1; shift ;;

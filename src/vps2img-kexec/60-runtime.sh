@@ -40,58 +40,7 @@ interface_device_node() {
 }
 
 discover_configuration() {
-	local nameserver bridge_member altname source_interface
-	[[ -n "$TARGET_HOSTNAME" ]] || TARGET_HOSTNAME=$(hostname -s)
-	[[ -n "$TARGET_INTERFACE" ]] || TARGET_INTERFACE=$(ip -4 route show default | awk 'NR == 1 { print $5; exit }')
-	[[ -n "$TARGET_INTERFACE" ]] || die 'cannot determine the default network interface; set --interface'
-	# The source address and default route live on the interface that carries
-	# them (a bridge such as vmbrX), not on its physical member. Remember it
-	# before the member mapping below and use it to discover IPv4/gateway.
-	source_interface=$TARGET_INTERFACE
-	# A PVE host's vmbrX is not a deployable interface. Resolve its physical
-	# bridge member first, then preserve the member name and all kernel altnames.
-	if [[ "$TARGET_INTERFACE" == vmbr* ]]; then
-		bridge_member=$(ip -o link show master "$TARGET_INTERFACE" | awk -F': |@' 'NR == 1 { print $2; exit }')
-		if [[ -n "$bridge_member" ]]; then
-			warn "mapping source bridge $TARGET_INTERFACE to target interface $bridge_member"
-			TARGET_INTERFACE=$bridge_member
-		else
-			warn "source bridge $TARGET_INTERFACE has no visible member; target will use fallback discovery"
-		fi
-	fi
-	[[ -n "$TARGET_INTERFACE_NAMES" ]] || TARGET_INTERFACE_NAMES=$TARGET_INTERFACE
-	while read -r altname; do
-		[[ -n "$altname" ]] || continue
-		case ",$TARGET_INTERFACE_NAMES," in
-			*,"$altname",*) ;;
-			*) TARGET_INTERFACE_NAMES="$TARGET_INTERFACE_NAMES,$altname" ;;
-		esac
-	done < <(ip -o link show dev "$TARGET_INTERFACE" | awk '{ for (i = 1; i <= NF; i++) if ($i == "altname") { name = $(i + 1); sub(/\\$/, "", name); print name } }')
-	if [[ -z "$TARGET_MAC" ]]; then
-		[[ -r "/sys/class/net/$TARGET_INTERFACE/address" ]] || die "cannot determine MAC address for $TARGET_INTERFACE"
-		TARGET_MAC=$(cat "/sys/class/net/$TARGET_INTERFACE/address")
-	fi
-	TARGET_MAC=$(printf '%s' "$TARGET_MAC" | tr '[:upper:]' '[:lower:]')
-	[[ -n "$TARGET_IPV4_CIDR" ]] || \
-		TARGET_IPV4_CIDR=$(ip -4 -o addr show dev "$TARGET_INTERFACE" scope global | awk 'NR == 1 { print $4; exit }')
-	[[ -n "$TARGET_IPV4_CIDR" ]] || \
-		TARGET_IPV4_CIDR=$(ip -4 -o addr show dev "$source_interface" scope global | awk 'NR == 1 { print $4; exit }')
-	[[ -n "$TARGET_IPV4_CIDR" ]] || die 'cannot determine the current IPv4 address; set --ipv4'
-	[[ -n "$TARGET_GATEWAY" ]] || \
-		TARGET_GATEWAY=$(ip -4 route show default dev "$TARGET_INTERFACE" | awk 'NR == 1 { print $3; exit }')
-	[[ -n "$TARGET_GATEWAY" ]] || \
-		TARGET_GATEWAY=$(ip -4 route show default dev "$source_interface" | awk 'NR == 1 { print $3; exit }')
-	[[ -n "$TARGET_GATEWAY" ]] || \
-		TARGET_GATEWAY=$(ip -4 route show default | awk 'NR == 1 { print $3; exit }')
-	[[ -n "$TARGET_GATEWAY" ]] || die 'cannot determine the default gateway; set --gateway'
-	if [[ -z "$TARGET_DNS" ]]; then
-		nameserver=$(awk '/^nameserver[[:space:]]+/ { print $2 }' /etc/resolv.conf | paste -sd ';' -)
-		TARGET_DNS=$nameserver
-	fi
-	TARGET_DNS=${TARGET_DNS//,/;}
-	TARGET_DNS=${TARGET_DNS// /;}
-	[[ "$TARGET_DNS" == '' || "$TARGET_DNS" == *';' ]] || TARGET_DNS+=';'
-
+	(#@INCLUDE@expand) src/assets/discover-network.sh
 	# Capture the source NIC and storage driver modules so /init can modprobe
 	# them on a physical machine whose kernel ships them as modules. The whole
 	# driver chain is captured (virtio_net and virtio_pci; the storage leaf,
@@ -104,26 +53,7 @@ discover_configuration() {
 	if [[ -z "$TARGET_DISK_DRIVERS" ]]; then
 		TARGET_DISK_DRIVERS=$(device_driver_modules "/sys/class/block/${TARGET_DISK##*/}/device" | sort -u | paste -sd ' ' -)
 	fi
-
-	[[ "$TARGET_HOSTNAME" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$ ]] || \
-		die "invalid target hostname: $TARGET_HOSTNAME"
-	[[ "$TARGET_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || \
-		die "invalid target user: $TARGET_USER"
-	[[ "$TARGET_PASSWORD" != *$'\n'* && "$TARGET_PASSWORD" != *$'\r'* ]] || \
-		die 'the target password may not contain a newline'
-	[[ "$TARGET_INTERFACE" =~ ^[A-Za-z0-9_.:-]+$ ]] || \
-		die "invalid target interface: $TARGET_INTERFACE"
-	[[ "$TARGET_INTERFACE_NAMES" =~ ^[A-Za-z0-9_.:-]+(,[A-Za-z0-9_.:-]+)*$ ]] || \
-		die "invalid target interface names: $TARGET_INTERFACE_NAMES"
-	[[ "$TARGET_MAC" =~ ^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$ ]] || \
-		die "invalid target MAC address: $TARGET_MAC"
-	[[ "$TARGET_IPV4_CIDR" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || \
-		die "invalid target IPv4 CIDR: $TARGET_IPV4_CIDR"
-	[[ "$TARGET_GATEWAY" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || \
-		die "invalid target gateway: $TARGET_GATEWAY"
-	[[ "$ROOT_SIZE_GIB" =~ ^[1-9][0-9]*$ ]] || die "invalid root size: $ROOT_SIZE_GIB GiB"
-	[[ "$CONFIG_SIZE_MIB" =~ ^[1-9][0-9]*$ ]] || die "invalid config size: $CONFIG_SIZE_MIB MiB"
-	[[ -s "$SSH_KEY_FILE" ]] || die "SSH authorized_keys file is missing or empty: $SSH_KEY_FILE"
+	(#@INCLUDE@expand) src/assets/validate-target.sh
 }
 
 detect_kernel() {
@@ -166,9 +96,7 @@ print_plan() {
 	printf 'boot method:     kexec (%s)\n' "$KEXEC_KERNEL"
 	printf 'ramdisk source:  %s\n' "$(ramdisk_source_description)"
 	printf 'image mode:      %s\n' "$IMAGE_MODE"
-	printf 'source root:     %s (%s)\n' "$ROOT_SOURCE" "$(findmnt -nro FSTYPE /)"
-	printf 'source disk:     %s\n' "$SOURCE_DISK"
-	printf 'target disk:     %s (%s bytes, %s)\n' "$TARGET_DISK" "$disk_bytes" "${model:-unknown model}"
+	(#@INCLUDE@expand) src/assets/plan-base.sh
 	if [[ "$IMAGE_MODE" == stream ]]; then
 		printf 'image source:    %s (streamed to disk, %s bytes)\n' "$IMAGE_RAW_URL" "$size_bytes"
 	elif [[ "$IMAGE_MODE" == disk ]]; then
@@ -178,10 +106,8 @@ print_plan() {
 		printf 'image source:    %s (embedded in initramfs, %s bytes)\n' "$RAW_FILE" "$size_bytes"
 	fi
 	printf 'image sha256:    %s\n' "${IMAGE_SHA256:-none (not verified)}"
-	printf 'target hostname: %s\n' "$TARGET_HOSTNAME"
-	printf 'target network:  %s (%s) names=%s %s via %s DNS %s\n' "$TARGET_INTERFACE" "$TARGET_MAC" "$TARGET_INTERFACE_NAMES" "$TARGET_IPV4_CIDR" "$TARGET_GATEWAY" "${TARGET_DNS:-none}"
-	printf 'root/config:     %s GiB Btrfs / Combustion to end of disk (min %s MiB)\n' "$ROOT_SIZE_GIB" "$CONFIG_SIZE_MIB"
-	printf 'SSH keys:        %s\n' "$SSH_KEY_FILE"
+	(#@INCLUDE@expand) src/assets/plan-target.sh
+	(#@INCLUDE@expand) src/assets/plan-disk.sh
 	if [[ "$IMAGE_MODE" == embed ]]; then
 		printf 'raw partition table:\n'
 		sfdisk --dump "$RAW_FILE" 2>/dev/null || warn 'sfdisk could not print the raw image partition table'
@@ -319,30 +245,6 @@ resolve_ramdisk_source() {
 	esac
 }
 
-# stage_binary_into copies an executable and every shared library it needs into
-# a filesystem tree rooted at $1, preserving absolute paths so the interpreter
-# and rpath references keep working inside the initramfs.
-stage_binary_into() {
-	local root=$1 source=$2 real dependency dependency_real
-	real=$(readlink -f "$source")
-	[[ -x "$real" ]] || die "cannot stage executable: $source"
-	mkdir -p "$root$(dirname "$source")" "$root$(dirname "$real")"
-	# Resolve Debian alternatives/symlink entry points inside the initramfs;
-	# copying the absolute symlink alone would point back at the source root.
-	cp -aL "$source" "$root$source"
-	cp -a "$real" "$root$real"
-	while read -r dependency; do
-		[[ -z "$dependency" || "$dependency" == linux-vdso* ]] && continue
-		[[ -e "$dependency" || -L "$dependency" ]] || continue
-		mkdir -p "$root$(dirname "$dependency")"
-		cp -aL "$dependency" "$root$dependency"
-		dependency_real=$(readlink -f "$dependency")
-		if [[ -e "$dependency_real" ]]; then
-			mkdir -p "$root$(dirname "$dependency_real")"
-			cp -a "$dependency_real" "$root$dependency_real"
-		fi
-	done < <(ldd "$real" 2>/dev/null | awk '/=> \/[^ ]+/ { print $3 } /^[[:space:]]*\/[^ ]+/ { print $1 }')
-}
 
 # module_names_to_stage lists every module the running (physical) machine has
 # in use, plus the drivers and filesystems the deploy initramfs always needs.
@@ -692,13 +594,3 @@ flush_disk
 for node in $(lsblk -nrpo NAME,TYPE "$DISK" | awk '$2 == "part" { print $1 }'); do
 	[[ -z "$(findmnt -rn -S "$node" || true)" ]] || fail "target partition is still mounted: $node"
 done
-
-# The raw image was streamed (or embedded then written) to the disk by /init.
-# Parse its GPT from the disk itself: there is no local raw file to read.
-SECTOR_SIZE=$(sfdisk --dump "$DISK" 2>/dev/null | awk '/^sector-size:/ { print $2; exit }')
-DISK_SECTORS=$(blockdev --getsz "$DISK")
-RAW_TABLE=$(sfdisk --dump "$DISK" 2>/dev/null)
-RAW_DISK_GUID=$(printf '%s\n' "$RAW_TABLE" | awk '/^label-id:/ { print $2; exit }')
-RAW_P1_LINE=$(printf '%s\n' "$RAW_TABLE" | awk -v part="${DISK}1" '$1 == part { print; exit }')
-RAW_P2_LINE=$(printf '%s\n' "$RAW_TABLE" | awk -v part="${DISK}2" '$1 == part { print; exit }')
-RAW_P3_LINE=$(printf '%s\n' "$RAW_TABLE" | awk -v part="${DISK}3" '$1 == part { print; exit }')

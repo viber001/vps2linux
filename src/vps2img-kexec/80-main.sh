@@ -1,138 +1,23 @@
-	printf '%s\n' "$value"
-}
-RAW_P1_START=$(table_field "$RAW_P1_LINE" start)
-RAW_P1_SIZE=$(table_field "$RAW_P1_LINE" size)
-RAW_P1_TYPE=$(table_field "$RAW_P1_LINE" type)
-RAW_P1_UUID=$(table_field "$RAW_P1_LINE" uuid)
-RAW_P2_START=$(table_field "$RAW_P2_LINE" start)
-RAW_P2_SIZE=$(table_field "$RAW_P2_LINE" size)
-RAW_P2_TYPE=$(table_field "$RAW_P2_LINE" type)
-RAW_P2_UUID=$(table_field "$RAW_P2_LINE" uuid)
-RAW_ROOT_START=$(table_field "$RAW_P3_LINE" start)
-RAW_P3_TYPE=$(table_field "$RAW_P3_LINE" type)
-RAW_P3_UUID=$(table_field "$RAW_P3_LINE" uuid)
-[[ "$SECTOR_SIZE" =~ ^[0-9]+$ && "$RAW_ROOT_START" =~ ^[0-9]+$ ]] || fail 'cannot calculate the Combustion partition offset'
-[[ -n "$RAW_DISK_GUID" && -n "$RAW_P1_START" && -n "$RAW_P1_SIZE" && -n "$RAW_P1_TYPE" && -n "$RAW_P1_UUID" && \
-	-n "$RAW_P2_START" && -n "$RAW_P2_SIZE" && -n "$RAW_P2_TYPE" && -n "$RAW_P2_UUID" && \
-	-n "$RAW_P3_TYPE" && -n "$RAW_P3_UUID" ]] || fail 'cannot read the raw image GPT metadata from the disk'
-ROOT_SIZE_SECTORS=$((ROOT_SIZE_GIB * 1024 * 1024 * 1024 / SECTOR_SIZE))
-ALIGN_SECTORS=$((1048576 / SECTOR_SIZE))
-CONFIG_START=$((RAW_ROOT_START + ROOT_SIZE_SECTORS))
-CONFIG_START=$(((CONFIG_START + ALIGN_SECTORS - 1) / ALIGN_SECTORS * ALIGN_SECTORS))
-	# openSUSE Leap Micro and other KIWI SelfInstall images grow the root
-	# partition to fill any unpartitioned space on the first boot and recreate
-	# kiwi_RootPart immediately after the last partition.  That would move our
-	# root partition and orphan the root filesystem.  Extend the Combustion
-	# partition to the end of the disk so no free space remains and the image's
-	# first-boot repartitioning is skipped.
-	CONFIG_SIZE=$((DISK_SECTORS - 34 - CONFIG_START))
-	(( CONFIG_SIZE >= CONFIG_SIZE_MIB * 1024 * 1024 / SECTOR_SIZE )) || \
-		fail 'not enough free space for the Combustion partition'
-	CONFIG_END=$((CONFIG_START + CONFIG_SIZE - 1))
-# The kernel partition devices scanned at boot describe the old PVE layout.
-# The image was just written, so remove any stale mapping before sgdisk.
-partx -d "$DISK" 2>/dev/null || true
-sgdisk --zap-all "$DISK"
-sgdisk \
-	--disk-guid="$RAW_DISK_GUID" \
-	--new=1:"$RAW_P1_START":"$((RAW_P1_START + RAW_P1_SIZE - 1))" \
-	--typecode=1:"$RAW_P1_TYPE" --partition-guid=1:"$RAW_P1_UUID" --change-name=1:p.legacy \
-	--new=2:"$RAW_P2_START":"$((RAW_P2_START + RAW_P2_SIZE - 1))" \
-	--typecode=2:"$RAW_P2_TYPE" --partition-guid=2:"$RAW_P2_UUID" --change-name=2:p.UEFI \
-	--new=3:"$RAW_ROOT_START":"$((RAW_ROOT_START + ROOT_SIZE_SECTORS - 1))" \
-	--typecode=3:"$RAW_P3_TYPE" --partition-guid=3:"$RAW_P3_UUID" --change-name=3:p.lxroot \
-	--new=4:"$CONFIG_START":"$CONFIG_END" \
-	--typecode=4:0FC63DAF-8483-4772-8E79-3D69D8477DE4 --change-name=4:combustion \
-	"$DISK"
-sync
-sgdisk --verify "$DISK" || fail "the target GPT failed verification: $DISK"
-ACTUAL_ROOT=$(sfdisk --dump "$DISK" | awk -v part="${DISK}3" '$1 == part { gsub(/,/, "", $4); gsub(/,/, "", $6); print $4 " " $6; exit }')
-[[ "$ACTUAL_ROOT" == "$RAW_ROOT_START $ROOT_SIZE_SECTORS" ]] || \
-	fail "target GPT root partition mismatch: expected $RAW_ROOT_START/$ROOT_SIZE_SECTORS, got ${ACTUAL_ROOT:-missing}"
-# Assert the Combustion partition exists and no >10 MiB hole is left: openSUSE
-# Leap Micro's first boot (55kiwi-repart) relocates kiwi_RootPart and drops
-# this partition whenever more than ~10 MiB of unpartitioned space is free.
-ACTUAL_CONFIG=$(sfdisk --dump "$DISK" | awk -v part="${DISK}4" '$1 == part { print $1 }')
-[[ -n "$ACTUAL_CONFIG" ]] || fail 'the Combustion partition was not created'
-LAST_USABLE=$((DISK_SECTORS - 34))
-FREE_SECTORS=$((LAST_USABLE - CONFIG_END))
-(( FREE_SECTORS * SECTOR_SIZE < 10 * 1024 * 1024 )) || \
-	fail "target disk still has ${FREE_SECTORS} free sectors; Leap Micro would repartition it"
+(#@INCLUDE@expand) src/assets/deploy-lib.sh
+GPT_SOURCE=$DISK
+(#@INCLUDE@expand) src/assets/deploy-gpt.sh
+(#@INCLUDE@expand) src/assets/deploy-combustion.sh
 
-CONFIG_OFFSET=$((CONFIG_START * SECTOR_SIZE))
-CONFIG_BYTES=$((CONFIG_SIZE * SECTOR_SIZE))
-CONFIG_LOOP=$(losetup --find --show --offset "$CONFIG_OFFSET" --sizelimit "$CONFIG_BYTES" "$DISK") || \
-	fail 'cannot create a loop device for the Combustion partition'
-cleanup_config() {
-	umount /config 2>/dev/null || true
-	losetup -d "$CONFIG_LOOP" 2>/dev/null || true
-}
-trap cleanup_config EXIT
-mke2fs -F -t ext4 -L combustion "$CONFIG_LOOP"
-mkdir -p /config
-mount "$CONFIG_LOOP" /config
-mkdir -p /config/combustion
-
-# sshd policy: password authentication is enabled only when a password was
-# requested, and root password login only when the requested user is root.
-SSHD_PASSWORD_AUTH=no
-SSHD_ROOT_LOGIN=prohibit-password
-if [[ -n "$TARGET_PASSWORD" ]]; then
-	SSHD_PASSWORD_AUTH=yes
-	[[ "$TARGET_USER" != root ]] || SSHD_ROOT_LOGIN=yes
-fi
-
-(#@HEREDOC@expand) cat > /config/combustion/script <<COMBUSTION | src/assets/combustion-kexec.sh
+(#@HEREDOC@expand) cat > /config/combustion/script <<COMBUSTION | src/assets/combustion.sh
 chmod 0700 /config/combustion/script
 sync
 umount /config
 losetup -d "$CONFIG_LOOP"
 trap - EXIT
 
-# Refresh the kernel partition table to the freshly written GPT before
-# efibootmgr resolves partition 2, and create an explicit NVRAM entry.
-partx -u "$DISK" 2>/dev/null || true
+# Refresh the kernel partition table to the freshly written GPT before the
+# root filesystem is mounted to grow it.
 blockdev --rereadpt "$DISK" 2>/dev/null || true
 
-# Grow the image's root filesystem to fill the (larger) root partition before
-# the first boot. Filling the disk with the Combustion partition suppresses the
-# image's own growroot / kiwi-repart first-boot resize, so grow it here or the
-# root stays at its small image size (a few GiB) inside a large partition.
-# btrfs resize needs a mounted path, so mount the partition briefly; the
-# Combustion script also grows it as a fallback if this cannot run.
-ROOT_PART=$DISK
-case "$DISK" in
-	/dev/nvme*|/dev/mmcblk*|/dev/loop*) ROOT_PART="${DISK}p3" ;;
-	*) ROOT_PART="${DISK}3" ;;
-esac
-if [[ -b "$ROOT_PART" ]] && command -v btrfs >/dev/null 2>&1; then
-	modprobe btrfs 2>/dev/null || true
-	mkdir -p /mnt/root
-	if mount -o rw "$ROOT_PART" /mnt/root 2>/dev/null; then
-		if btrfs filesystem resize max /mnt/root; then
-			printf 'Grew the root filesystem on %s to fill the partition\n' "$ROOT_PART"
-		else
-			printf 'WARNING: could not grow the root filesystem on %s\n' "$ROOT_PART" >&2
-		fi
-		umount /mnt/root 2>/dev/null || true
-	else
-		printf 'WARNING: could not mount %s to grow the root filesystem\n' "$ROOT_PART" >&2
-	fi
-else
-	printf 'WARNING: btrfs is unavailable; the root filesystem was not grown here\n' >&2
-fi
-
-if [[ -d /sys/firmware/efi ]]; then
-	command -v efibootmgr >/dev/null 2>&1 || fail 'UEFI boot detected but efibootmgr is not staged'
-	efibootmgr -c -d "$DISK" -p 2 -L 'vps2img-kexec' -l '\EFI\BOOT\BOOTX64.EFI' || \
-		fail 'efibootmgr could not create the vps2img-kexec boot entry'
-	efibootmgr -v || fail 'efibootmgr could not read the new boot entry'
-else
-	printf '%s\n' 'UEFI runtime unavailable; relying on the EFI fallback path or BIOS boot code.'
-fi
-	flush_disk
-	printf '%s\n' 'Raw image written. Rebooting into the new system.'
-reboot -f
+(#@INCLUDE@expand) src/assets/deploy-growroot.sh
+(#@INCLUDE@expand) src/assets/deploy-efi.sh
+flush_disk
+(#@INCLUDE@expand) src/assets/deploy-reboot.sh
 DEPLOY
 	chmod 0755 "$STAGE/deploy"
 }
@@ -388,13 +273,13 @@ build_initramfs_host() {
 	for command_name in bash blkid dd dropbear efibootmgr findmnt losetup lsblk mke2fs partx sfdisk sgdisk; do
 		command_file=$(command_path "$command_name")
 		[[ -n "$command_file" ]] || die "cannot stage command into the initramfs: $command_name"
-		stage_binary_into "$STAGE" "$command_file"
+		stage_binary "$STAGE" "$command_file"
 	done
 	# btrfs-progs grows the image's root filesystem to fill its partition; it is
 	# optional so the deploy still works on a source without btrfs-progs (the
 	# Combustion script grows the filesystem as a fallback).
 	if command_file=$(command_path btrfs); then
-		stage_binary_into "$STAGE" "$command_file"
+		stage_binary "$STAGE" "$command_file"
 	else
 		warn 'btrfs is not installed on the source; the root filesystem will be grown by the target instead'
 	fi
@@ -471,6 +356,7 @@ finalize_initramfs() {
 		printf 'TARGET_DISK_DRIVERS=%q\n' "$TARGET_DISK_DRIVERS"
 		printf 'ROOT_SIZE_GIB=%q\n' "$ROOT_SIZE_GIB"
 		printf 'CONFIG_SIZE_MIB=%q\n' "$CONFIG_SIZE_MIB"
+		printf 'REBOOT_DELAY=%q\n' "$REBOOT_DELAY"
 	} > "$STAGE/deploy.env"
 
 	write_init
@@ -546,6 +432,7 @@ parse_args() {
 			--ssh-key-file) SSH_KEY_FILE=${2:?missing value for --ssh-key-file}; shift 2 ;;
 			--root-size-gib) ROOT_SIZE_GIB=${2:?missing value for --root-size-gib}; shift 2 ;;
 			--config-size-mib) CONFIG_SIZE_MIB=${2:?missing value for --config-size-mib}; shift 2 ;;
+			--reboot-delay) REBOOT_DELAY=${2:?missing value for --reboot-delay}; shift 2 ;;
 			--kernel) KEXEC_KERNEL=${2:?missing value for --kernel}; shift 2 ;;
 			--ramdisk-source) RAMDISK_SOURCE=${2:?missing value for --ramdisk-source}; shift 2 ;;
 			--di-mirror) DI_MIRROR=${2:?missing value for --di-mirror}; shift 2 ;;

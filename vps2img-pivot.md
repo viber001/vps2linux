@@ -124,6 +124,20 @@ umount -Rl /oldroot                       # 懒卸载
 - 加入 `nodiscard`+`fsfreeze` 缓解后，多轮部署得到干净结果（无 `csum failed`，`ld-linux` 完整）。
 - **间歇性故障**：曾出现一次 `pivot_root` 之后面板侧突然复位（无内核 panic、非 watchdog、非脚本错误路径），第二次 `qm reset` 可恢复；其余轮次均干净。原因未最终定位。
 
+### 7. 旧内核里不能 resize 新的 btrfs（2026-10-21）
+
+**现象**：pivot 在 dd 之后挂 `/dev/sda3` 做 `btrfs filesystem resize max`，进程永久 `State: D (disk sleep)`，`/proc/<pid>/stack` 为 `percpu_rwsem_wait` → `mnt_want_write_file` → `btrfs_ioctl_resize`。
+
+**根因**：pivot 全程运行旧内核。旧 root 的 btrfs superblock 被 `fsfreeze` 冻结、`umount -Rl /oldroot` 惰性卸载后**仍登记在旧内核中**；dd 后重新 mount 同一块设备会 join 回那个旧 superblock（拿到的不是刚写入的镜像），而 `btrfs_ioctl_resize` 需要 `sb_start_write` 的 percpu 写者锁，旧 root 仍冻结 → 永久阻塞。`fsfreeze --unfreeze` 能解开锁，但 resize 作用的仍是旧 superblock，属于错误对象。
+
+**结论**：pivot 内层设 `GROW_ROOT_IN_RAM=no`，跳过 RAM 扩容，也不 stage `btrfs`/`modprobe`；由目标首启的 Combustion 脚本执行 `btrfs filesystem resize max /`（`deploy-growroot.sh` 的 `GROW_ROOT_IN_RAM` 开关只对 kexec 生效，其新内核无陈旧 btrfs 状态）。实测 dmesg：`resize device /dev/sda3 (devid 1) from 3010441216 to 107374182400`，`df -h /` 为 100G。
+
+### 8. 切换期 SSH 与首启后 SSH（2026-10-21 实测）
+
+- 源装有 `dropbear-bin` 时：冻结旧 PID1 → `kill_old_sshd` → dropbear 监听 22（仅 root 公钥），切换期可持续操作，日志可见内层 deployer 走到 `Writing ... to /dev/sda`。
+- 源**未装** dropbear：整段接管被跳过，旧 sshd 随 `/oldroot` 冻结而失效，`fsfreeze` 后既无控制通道也不写盘（本次实测卡在此处，日志已确认 GPT 未改动）。
+- 切换完成后由目标系统自己的 sshd 接管 22：`root`（`prohibit-password`）与 `leap`（wheel，`authorized_keys` 已写入 `/home/leap/.ssh/authorized_keys`）均可公钥登录，`PasswordAuthentication yes` 由 `90-vps2img-pivot.conf` 设置。
+
 ## 已知限制
 
 - 旧内核/旧 systemd 未真正终止，存在理论上的旧 root 写回/损坏风险；缓解只降低概率，不根除。要根除请用 `vps2img-kexec`（kexec）。

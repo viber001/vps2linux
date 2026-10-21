@@ -48,7 +48,7 @@
 ```
 
 `<command>` 是完整的 heredoc 命令行，例如
-`cat > /run/config/combustion/script <<COMBUSTION`，可按**最后一个** ` | ` 与其后的
+`cat > /config/combustion/script <<COMBUSTION`，可按**最后一个** ` | ` 与其后的
 `<path>` 切开（命令行本身不含 ` | `；`<path>` 不含 `|`、空白、换行）。
 
 预处理器的输出为：
@@ -96,12 +96,16 @@ vps2img-pivot:
 	chmod 0755 $@
 ```
 
-合并顺序沿用现有约定：lib 占 10/30/50/70，各程序占 00/20/40/60/80，编号不重叠。
+合并顺序沿用现有约定：lib 占 10/30/50，各程序占 00/20/40/60/80，编号不重叠。
 
 ## 组件
 
 - `tools/build.py`：预处理器（仅标准库）。
 - `src/assets/`：仅被指令引用的正文，不参与合并。
-  - `combustion-base.sh`：两个程序共享的 105 行 Combustion 正文（含 `@PROGRAM@`）。
-  - `combustion-pivot.sh`：`(#@INCLUDE@) …combustion-base.sh` + pivot 专属尾部。
-  - `combustion-kexec.sh`：同上 + kexec 专属尾部。
+  - `combustion.sh`：Combustion 正文入口，`(#@INCLUDE@)` 依次拉入 `combustion-base.sh`、
+    `combustion-user.sh`、`combustion-growroot.sh`。
+  - `deploy-*.sh`：两个程序内层 deployer 的公共段（`deploy-lib.sh` 的 `table_field`/
+    `partition_path`、`deploy-gpt.sh`、`deploy-combustion.sh`、`deploy-growroot.sh`、
+    `deploy-efi.sh`），用 `(#@INCLUDE@expand)` 注入内层 heredoc 正文。
+  - `discover-network.sh`、`validate-target.sh`：`discover_configuration` 的公共前缀与校验块。
+  - `plan-base.sh`、`plan-target.sh`、`plan-disk.sh`：`print_plan` 的公共字段。

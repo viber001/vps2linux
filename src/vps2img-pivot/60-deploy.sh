@@ -1,76 +1,7 @@
 
 discover_configuration() {
-	local nameserver bridge_member altname source_interface
-	[[ -n "$TARGET_HOSTNAME" ]] || TARGET_HOSTNAME=$(hostname -s)
-	[[ -n "$TARGET_INTERFACE" ]] || TARGET_INTERFACE=$(ip -4 route show default | awk 'NR == 1 { print $5; exit }')
-	[[ -n "$TARGET_INTERFACE" ]] || die 'cannot determine the default network interface; set --interface'
-	# The source address and default route live on the interface that carries
-	# them (a bridge such as vmbrX), not on its physical member. Remember it
-	# before the member mapping below and use it to discover IPv4/gateway.
-	source_interface=$TARGET_INTERFACE
-	# A PVE host's vmbrX is not a deployable interface. Resolve its physical
-	# bridge member first, then preserve the member name and all kernel altnames.
-	if [[ "$TARGET_INTERFACE" == vmbr* ]]; then
-		bridge_member=$(ip -o link show master "$TARGET_INTERFACE" | awk -F': |@' 'NR == 1 { print $2; exit }')
-		if [[ -n "$bridge_member" ]]; then
-			warn "mapping source bridge $TARGET_INTERFACE to target interface $bridge_member"
-			TARGET_INTERFACE=$bridge_member
-		else
-			warn "source bridge $TARGET_INTERFACE has no visible member; target will use fallback discovery"
-		fi
-	fi
-	[[ -n "$TARGET_INTERFACE_NAMES" ]] || TARGET_INTERFACE_NAMES=$TARGET_INTERFACE
-	while read -r altname; do
-		[[ -n "$altname" ]] || continue
-		case ",$TARGET_INTERFACE_NAMES," in
-			*,"$altname",*) ;;
-			*) TARGET_INTERFACE_NAMES="$TARGET_INTERFACE_NAMES,$altname" ;;
-		esac
-	done < <(ip -o link show dev "$TARGET_INTERFACE" | awk '{ for (i = 1; i <= NF; i++) if ($i == "altname") { name = $(i + 1); sub(/\\$/, "", name); print name } }')
-	if [[ -z "$TARGET_MAC" ]]; then
-		[[ -r "/sys/class/net/$TARGET_INTERFACE/address" ]] || die "cannot determine MAC address for $TARGET_INTERFACE"
-		TARGET_MAC=$(cat "/sys/class/net/$TARGET_INTERFACE/address")
-	fi
-	TARGET_MAC=$(printf '%s' "$TARGET_MAC" | tr '[:upper:]' '[:lower:]')
-	[[ -n "$TARGET_IPV4_CIDR" ]] || \
-		TARGET_IPV4_CIDR=$(ip -4 -o addr show dev "$TARGET_INTERFACE" scope global | awk 'NR == 1 { print $4; exit }')
-	[[ -n "$TARGET_IPV4_CIDR" ]] || \
-		TARGET_IPV4_CIDR=$(ip -4 -o addr show dev "$source_interface" scope global | awk 'NR == 1 { print $4; exit }')
-	[[ -n "$TARGET_IPV4_CIDR" ]] || die 'cannot determine the current IPv4 address; set --ipv4'
-	[[ -n "$TARGET_GATEWAY" ]] || \
-		TARGET_GATEWAY=$(ip -4 route show default dev "$TARGET_INTERFACE" | awk 'NR == 1 { print $3; exit }')
-	[[ -n "$TARGET_GATEWAY" ]] || \
-		TARGET_GATEWAY=$(ip -4 route show default dev "$source_interface" | awk 'NR == 1 { print $3; exit }')
-	[[ -n "$TARGET_GATEWAY" ]] || \
-		TARGET_GATEWAY=$(ip -4 route show default | awk 'NR == 1 { print $3; exit }')
-	[[ -n "$TARGET_GATEWAY" ]] || die 'cannot determine the default gateway; set --gateway'
-	if [[ -z "$TARGET_DNS" ]]; then
-		nameserver=$(awk '/^nameserver[[:space:]]+/ { print $2 }' /etc/resolv.conf | paste -sd ';' -)
-		TARGET_DNS=$nameserver
-	fi
-	TARGET_DNS=${TARGET_DNS//,/;}
-	TARGET_DNS=${TARGET_DNS// /;}
-	[[ "$TARGET_DNS" == '' || "$TARGET_DNS" == *';' ]] || TARGET_DNS+=';'
-
-	[[ "$TARGET_HOSTNAME" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$ ]] || \
-		die "invalid target hostname: $TARGET_HOSTNAME"
-	[[ "$TARGET_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || \
-		die "invalid target user: $TARGET_USER"
-	[[ "$TARGET_PASSWORD" != *$'\n'* && "$TARGET_PASSWORD" != *$'\r'* ]] || \
-		die 'the target password may not contain a newline'
-	[[ "$TARGET_INTERFACE" =~ ^[A-Za-z0-9_.:-]+$ ]] || \
-		die "invalid target interface: $TARGET_INTERFACE"
-	[[ "$TARGET_INTERFACE_NAMES" =~ ^[A-Za-z0-9_.:-]+(,[A-Za-z0-9_.:-]+)*$ ]] || \
-		die "invalid target interface names: $TARGET_INTERFACE_NAMES"
-	[[ "$TARGET_MAC" =~ ^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$ ]] || \
-		die "invalid target MAC address: $TARGET_MAC"
-	[[ "$TARGET_IPV4_CIDR" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || \
-		die "invalid target IPv4 CIDR: $TARGET_IPV4_CIDR"
-	[[ "$TARGET_GATEWAY" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || \
-		die "invalid target gateway: $TARGET_GATEWAY"
-	[[ "$ROOT_SIZE_GIB" =~ ^[1-9][0-9]*$ ]] || die "invalid root size: $ROOT_SIZE_GIB GiB"
-	[[ "$CONFIG_SIZE_MIB" =~ ^[1-9][0-9]*$ ]] || die "invalid config size: $CONFIG_SIZE_MIB MiB"
-	[[ -s "$SSH_KEY_FILE" ]] || die "SSH authorized_keys file is missing or empty: $SSH_KEY_FILE"
+	(#@INCLUDE@expand) src/assets/discover-network.sh
+	(#@INCLUDE@expand) src/assets/validate-target.sh
 }
 
 check_target_mounts() {
@@ -88,15 +19,11 @@ print_plan() {
 	disk_bytes=$(blockdev --getsize64 "$TARGET_DISK")
 	model=$(lsblk -dnro MODEL "$TARGET_DISK" | sed 's/[[:space:]]*$//')
 	printf '%s\n' '=== VPS2IMG_PIVOT PLAN ==='
-	printf 'source root:    %s (%s)\n' "$ROOT_SOURCE" "$(findmnt -nro FSTYPE /)"
-	printf 'source disk:    %s\n' "$SOURCE_DISK"
-	printf 'target disk:    %s (%s bytes, %s)\n' "$TARGET_DISK" "$disk_bytes" "${model:-unknown model}"
-	printf 'raw image:      %s (%s bytes)\n' "$RAW_FILE" "$size_bytes"
-	printf 'target hostname: %s\n' "$TARGET_HOSTNAME"
-	printf 'target network:  %s (%s) names=%s %s via %s DNS %s\n' "$TARGET_INTERFACE" "$TARGET_MAC" "$TARGET_INTERFACE_NAMES" "$TARGET_IPV4_CIDR" "$TARGET_GATEWAY" "${TARGET_DNS:-none}"
+	(#@INCLUDE@expand) src/assets/plan-base.sh
+	printf 'raw image:       %s (%s bytes)\n' "$RAW_FILE" "$size_bytes"
+	(#@INCLUDE@expand) src/assets/plan-target.sh
 	printf 'login user:      %s\n' "$TARGET_USER"
-	printf 'root/config:     %s GiB Btrfs / Combustion to end of disk (min %s MiB)\n' "$ROOT_SIZE_GIB" "$CONFIG_SIZE_MIB"
-	printf 'SSH keys:        %s\n' "$SSH_KEY_FILE"
+	(#@INCLUDE@expand) src/assets/plan-disk.sh
 	printf 'raw partition table:\n'
 	sfdisk --dump "$RAW_FILE" 2>/dev/null || warn 'sfdisk could not print the raw image partition table'
 	if [[ "$SOURCE_DISK" == "$TARGET_DISK" ]]; then
@@ -114,28 +41,6 @@ check_dependencies() {
 	for command_name in hostname ip mountpoint paste; do
 		need_command "$command_name"
 	done
-}
-
-stage_binary() {
-	local source=$1 real dependency dependency_real
-	real=$(readlink -f "$source")
-	[[ -x "$real" ]] || die "cannot stage executable: $source"
-	mkdir -p "$BOOTSTRAP$(dirname "$source")" "$BOOTSTRAP$(dirname "$real")"
-	# Resolve Debian alternatives/symlink entry points inside the bootstrap;
-	# copying the absolute symlink alone would point back at the old root.
-	cp -aL "$source" "$BOOTSTRAP$source"
-	cp -a "$real" "$BOOTSTRAP$real"
-	while read -r dependency; do
-		[[ -z "$dependency" || "$dependency" == linux-vdso* ]] && continue
-		[[ -e "$dependency" || -L "$dependency" ]] || continue
-		mkdir -p "$BOOTSTRAP$(dirname "$dependency")"
-		cp -aL "$dependency" "$BOOTSTRAP$dependency"
-		dependency_real=$(readlink -f "$dependency")
-		if [[ -e "$dependency_real" ]]; then
-			mkdir -p "$BOOTSTRAP$(dirname "$dependency_real")"
-			cp -a "$dependency_real" "$BOOTSTRAP$dependency_real"
-		fi
-	done < <(ldd "$real" 2>/dev/null | awk '/=> \/[^ ]+/ { print $3 } /^[[:space:]]*\/[^ ]+/ { print $1 }')
 }
 
 stage_bootstrap() {
@@ -156,10 +61,45 @@ stage_bootstrap() {
 		sleep; do
 		command_file=$(command_path "$command_name")
 		[[ -n "$command_file" ]] || die "cannot stage command: $command_name"
-		stage_binary "$command_file"
+		stage_binary "$BOOTSTRAP" "$command_file"
 	done
 	if command_file=$(command_path efibootmgr); then
-		stage_binary "$command_file"
+		stage_binary "$BOOTSTRAP" "$command_file"
+	fi
+	# btrfs-progs is deliberately not staged: the RAM deployer cannot grow the
+	# new image's btrfs (the old kernel still holds the former root's frozen
+	# superblock), so the target's Combustion script does it on first boot.
+	# Convenience tools for the rescue shell. None of them is needed to deploy,
+	# so a source without them only makes the dropbear/console session poorer.
+	for command_name in ls ps tail head less more vi df du free hostname ip \
+		ping ss nc tcpdump find sort uniq wc; do
+		if command_file=$(command_path "$command_name"); then
+			stage_binary "$BOOTSTRAP" "$command_file"
+		else
+			warn "rescue tool is missing on the source: $command_name"
+		fi
+	done
+	# busybox backs the remaining applets with one small binary. Its applet
+	# symlinks only fill paths that no staged real binary already owns, so the
+	# whitelisted tools above keep precedence.
+	if command_file=$(command_path busybox); then
+		stage_binary "$BOOTSTRAP" "$command_file"
+		mkdir -p "$BOOTSTRAP/bin"
+		if [[ "$command_file" != /bin/busybox ]]; then
+			ln -sf "../${command_file#/}" "$BOOTSTRAP/bin/busybox"
+		fi
+		# Never let an applet shadow a staged real binary: the deployer needs
+		# the host's real mount/umount/sgdisk/dd semantics, not busybox's.
+		while read -r applet; do
+			applet=${applet##*/}
+			[[ -n "$applet" ]] || continue
+			for dir in bin sbin usr/bin usr/sbin; do
+				[[ -e "$BOOTSTRAP/$dir/$applet" || -L "$BOOTSTRAP/$dir/$applet" ]] && continue 2
+			done
+			ln -sf busybox "$BOOTSTRAP/bin/$applet"
+		done < <("$command_file" --list 2>/dev/null)
+	else
+		warn 'busybox is not installed on the source; the rescue shell only has the staged tools'
 	fi
 	# Optional rescue SSH for the RAM bootstrap: after pivot_root the old sshd
 	# (and the operator's original session) is terminated and a dropbear takes
@@ -168,10 +108,10 @@ stage_bootstrap() {
 	DROPBEAR_BIN=
 	if command_file=$(command_path dropbear); then
 		DROPBEAR_BIN=$command_file
-		stage_binary "$command_file"
+		stage_binary "$BOOTSTRAP" "$command_file"
 		command_file=$(command_path dropbearkey)
 		[[ -n "$command_file" ]] || die 'dropbear is installed but dropbearkey is missing'
-		stage_binary "$command_file"
+		stage_binary "$BOOTSTRAP" "$command_file"
 		mkdir -p "$BOOTSTRAP/etc/dropbear" "$BOOTSTRAP/root/.ssh" "$BOOTSTRAP/bin"
 		dropbearkey -t ed25519 -f "$BOOTSTRAP/etc/dropbear/dropbear_ed25519_host_key" >/dev/null 2>&1 || \
 			die 'dropbearkey could not generate a rescue host key'
@@ -200,6 +140,7 @@ TARGET_USER=$(printf '%q' "$TARGET_USER")
 TARGET_PASSWORD=$(printf '%q' "$TARGET_PASSWORD")
 ROOT_SIZE_GIB=$(printf '%q' "$ROOT_SIZE_GIB")
 CONFIG_SIZE_MIB=$(printf '%q' "$CONFIG_SIZE_MIB")
+REBOOT_DELAY=$(printf '%q' "$REBOOT_DELAY")
 DROPBEAR_BIN=$(printf '%q' "$DROPBEAR_BIN")
 EOF
 	cat > "$BOOTSTRAP/run/deploy" <<'INNER'
@@ -395,11 +336,3 @@ done
 printf 'Writing %s to %s\n' "$RAW" "$DISK"
 dd if="$RAW" of="$DISK" bs=16M conv=fsync status=progress
 sync
-
-SECTOR_SIZE=$(sfdisk --dump "$RAW" | awk '/^sector-size:/ { print $2; exit }')
-DISK_SECTORS=$(blockdev --getsz "$DISK")
-RAW_TABLE=$(sfdisk --dump "$RAW")
-RAW_DISK_GUID=$(printf '%s\n' "$RAW_TABLE" | awk '/^label-id:/ { print $2; exit }')
-RAW_P1_LINE=$(printf '%s\n' "$RAW_TABLE" | awk -v part="${RAW}1" '$1 == part { print; exit }')
-RAW_P2_LINE=$(printf '%s\n' "$RAW_TABLE" | awk -v part="${RAW}2" '$1 == part { print; exit }')
-RAW_P3_LINE=$(printf '%s\n' "$RAW_TABLE" | awk -v part="${RAW}3" '$1 == part { print; exit }')

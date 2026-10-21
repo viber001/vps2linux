@@ -52,9 +52,10 @@ http://10.68.247.14:16000/eiso/id/3/
 | 部署期救援 SSH | 源装有 `dropbear` 时，bootstrap 接管 22 端口（kill 旧 sshd 后 dropbear 监听，仅 root 公钥） | initramfs 内置 dropbear，监听 22 端口（仅 root 公钥） |
 | 用户配置 | `--user`/`--password`（默认 root/空） | `--user`/`--password`（默认 root/空） |
 | 执行确认变量 | `VPS2IMG_PIVOT_CONFIRM=WIPE:<disk>` | `VPS2IMG_KEXEC_CONFIRM=WIPE:<disk>` |
+| 重启前等待 | `--reboot-delay N`（默认 0） | `--reboot-delay N`（默认 0） |
 | 构建产物规模 | 约 0.9 千行 | 约 2.0 千行 |
 
-两者都需要 `--execute` 与各自的 `*_CONFIRM=WIPE:<disk>` 才能写盘，并共享 `src/lib/` 与 `src/assets/combustion-*.sh` 的公共代码。
+两者都需要 `--execute` 与各自的 `*_CONFIRM=WIPE:<disk>` 才能写盘，并共享 `src/lib/` 与 `src/assets/` 下的公共代码（Combustion 首启脚本、内层 deployer 公共段、plan 字段）。
 
 ## 当前用法
 
@@ -94,7 +95,7 @@ VPS2IMG_PIVOT_CONFIRM=WIPE:/dev/sda \
 
 当前版本的执行路径已经在 VM 600 上验证：PVE `ext4+LVM` 可以从 RAM bootstrap 覆盖为 Leap Micro `EFI+Btrfs`，并通过 `efibootmgr` 创建 `vps2img-pivot` 启动项；Combustion 首启已验证静态 IP 和 SSH 公钥登录。VM 602 的 PVE `Btrfs` root 也已完成端到端验证（400 GiB 目标盘、root 100 GiB、Combustion 填满剩余空间），首启后 hostname、静态 IPv4、SSH 公钥均由 Combustion 生效。
 
-pivot 的旧系统在部署期间仍存活，旧 sshd 一直占着 22。若源系统装有 `dropbear`，RAM bootstrap 会 stage `dropbear`/`dropbearkey`、现场生成临时 host key，在冻结旧 PID1 后 `kill` 旧 sshd 并让 **dropbear 接管 22 端口**（仅 root 公钥登录，公钥即 `--ssh-key-file`），失败时 `rescue()` 保持 SSH 与串口 shell。未装 `dropbear` 时该功能整体跳过，控制通道仍是旧系统自身的 SSH。详见 `vps2img-pivot.md`。
+pivot 的旧系统在部署期间仍存活，旧 sshd 一直占着 22。若源系统装有 `dropbear`，RAM bootstrap 会 stage `dropbear`/`dropbearkey`、现场生成临时 host key，在冻结旧 PID1 后 `kill` 旧 sshd 并让 **dropbear 接管 22 端口**（仅 root 公钥登录，公钥即 `--ssh-key-file`），失败时 `rescue()` 保持 SSH 与串口 shell。未装 `dropbear` 时该功能整体跳过，控制通道仍是旧系统自身的 SSH。详见 `vps2img-pivot.md`；此外 `--reboot-delay N`（两版都支持，默认 0）会在写盘完成后、重启前停留 N 秒，便于在重启前重连并检查救援 shell。
 
 ## vps2img-kexec（kexec + 自制 initramfs，方案 2）
 
@@ -175,6 +176,7 @@ VPS2IMG_KEXEC_CONFIRM=WIPE:/dev/sda \
 ## 文档索引
 
 - `docs/preprocessor.md`：`src/` 片段构建与指令语言参考。
+- `docs/combustion-script.md`：Combustion 首启脚本的完整生成结果与行为分析（扩容、10 MiB 空洞、网络、用户与 SSH）。
 - `vps2img-pivot.md`：`pivot_root` 方案的原理与测试历史。
 - `vps2img-kexec.md`：`kexec` + 自制 initramfs 方案的原理与测试历史。
 - `docs/original-vps2arch.md`：上游原版 vps2arch（<https://gitlab.com/drizzt/vps2arch>）的部署方法详解——下载 Arch bootstrap 到 `/root.x86_64/`、chroot 准备、`delete_all` 清空旧根、用 bootstrap 静态 `ld.so` 重新进入 chroot 执行 `pacstrap`，以及 bootloader/网络/SSH 配置。

@@ -36,6 +36,9 @@ Options:
   --root-size-gib N     Btrfs partition size (default: 64)
   --config-size-mib N   Minimum Combustion partition size (default: 1024);
                         the partition is extended to the end of the disk
+  --reboot-delay N      Seconds to wait after the image is written and before
+                        rebooting (default: 0); useful to reconnect to the
+                        rescue SSH or read the console
   --kernel FILE         Kernel image loaded with kexec (default: /boot/vmlinuz-\$(uname -r))
   --ramdisk-source SRC  Where the deploy ramdisk userspace comes from:
                         auto (default): stage the running host's tools when the

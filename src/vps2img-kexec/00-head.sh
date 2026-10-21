@@ -57,6 +57,7 @@ TARGET_PASSWORD=${VPS2IMG_KEXEC_PASSWORD:-}
 SSH_KEY_FILE=${VPS2IMG_KEXEC_SSH_KEY_FILE:-/root/.ssh/authorized_keys}
 ROOT_SIZE_GIB=${VPS2IMG_KEXEC_ROOT_SIZE_GIB:-64}
 CONFIG_SIZE_MIB=${VPS2IMG_KEXEC_CONFIG_SIZE_MIB:-1024}
+REBOOT_DELAY=${VPS2IMG_KEXEC_REBOOT_DELAY:-0}
 # --image-mode decides how the raw image reaches the target disk:
 #   stream  stream a raw image straight from an HTTP URL inside the initramfs;
 #   embed   unpack it on the source, then carry it inside the initramfs (this is
