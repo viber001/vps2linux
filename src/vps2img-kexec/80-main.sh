@@ -66,22 +66,24 @@ fetch_debian_index() {
 # Debian field continuation lines (which start with a space) are ignored, which
 # is safe because in practice only Description/Tag wrap.
 di_parse_index() {
-	local dist=$1 file=$2 name filename dependencies key
+	local dist=$1 file=$2 name filename dependencies sha256 key
 	[[ -n "${DI_INDEX_PARSED[$dist]:-}" ]] && return 0
 	DI_INDEX_PARSED[$dist]=1
-	while IFS=$'\t' read -r name filename dependencies; do
+	while IFS=$'\t' read -r name filename dependencies sha256; do
 		[[ -n "$name" && -n "$filename" ]] || continue
 		key=$dist/$name
 		DI_PKG_FILE[$key]=$filename
 		DI_PKG_DEP[$key]=$dependencies
+		DI_PKG_SHA256[$key]=$sha256
 		DI_PKG_DISTS[$name]="${DI_PKG_DISTS[$name]:-}${DI_PKG_DISTS[$name]:+ }$dist"
 	done < <(awk -v dist="$dist" '
 		/^Package: /{ name=substr($0,10) }
 		/^Filename: /{ filename=substr($0,11) }
+		/^SHA256: /{ sha256=substr($0,10) }
 		/^Depends: /{ dependencies=dependencies (dependencies?" ":"") substr($0,10) }
 		/^Pre-Depends: /{ dependencies=dependencies (dependencies?" ":"") substr($0,13) }
-		/^$/{ if(name!=""){ print name "\t" filename "\t" dependencies } name="";filename="";dependencies="" }
-		END{ if(name!=""){ print name "\t" filename "\t" dependencies } }
+		/^$/{ if(name!=""){ print name "\t" filename "\t" dependencies "\t" sha256 } name="";filename="";dependencies="";sha256="" }
+		END{ if(name!=""){ print name "\t" filename "\t" dependencies "\t" sha256 } }
 	' "$file")
 }
 
@@ -95,7 +97,7 @@ load_debian_indexes() {
 # resolve_debian_packages walks the dependency graph of the requested packages,
 # following shared-library dependencies (names starting with "lib") recursively
 # so the assembled initramfs has a complete runtime closure.  The result is the
-# global RESOLVED_DEBS array of "dist filename" entries.
+# global RESOLVED_DEBS array of tab-separated "dist filename sha256" entries.
 resolve_debian_packages() {
 	local -a queue=("$@")
 	local name key dist dependency depspec old_ifs
@@ -113,7 +115,7 @@ resolve_debian_packages() {
 		fi
 		for dist in ${DI_PKG_DISTS[$name]}; do
 			key=$dist/$name
-			RESOLVED_DEBS+=("$dist ${DI_PKG_FILE[$key]}")
+			RESOLVED_DEBS+=("$dist"$'\t'"${DI_PKG_FILE[$key]}"$'\t'"${DI_PKG_SHA256[$key]:-}")
 			depspec=${DI_PKG_DEP[$key]:-}
 			old_ifs=$IFS
 			IFS=,
@@ -148,17 +150,28 @@ extract_package_into() {
 	esac
 }
 
+verify_debian_package() {
+	local archive=$1 expected=$2 label=$3
+	[[ "$VERIFY_DEBIAN_PACKAGES" == 1 ]] || return 0
+	[[ "$expected" =~ ^[0-9A-Fa-f]{64}$ ]] || \
+		die "Debian package has no valid SHA-256 in the Packages index: $label"
+	expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
+	if ! printf '%s  %s\n' "$expected" "$archive" | sha256sum -c - >/dev/null; then
+		die "Debian package SHA-256 verification failed: $label"
+	fi
+}
+
 stage_debian_packages() {
-	local entry dist filename destination url
+	local entry dist filename expected_hash destination url
 	for entry in "${RESOLVED_DEBS[@]}"; do
-		dist=${entry%% *}
-		filename=${entry#* }
+		IFS=$'\t' read -r dist filename expected_hash <<< "$entry"
 		destination="$WORKDIR/debs/$(basename "$filename")"
 		if [[ ! -s "$destination" ]]; then
 			url="$DI_MIRROR/$filename"
 			printf 'Downloading Debian %s package: %s\n' "$dist" "$url"
 			download_file "$url" "$destination"
 		fi
+		verify_debian_package "$destination" "$expected_hash" "$filename"
 		extract_package_into "$destination" "$STAGE"
 	done
 }
@@ -182,7 +195,7 @@ unpack_debian_initrd() {
 # no host package manager is involved.  The extracted library directories are
 # added to LD_LIBRARY_PATH for the kexec calls.
 ensure_host_kexec() {
-	local entry dist filename destination kexec_path libdirs
+	local entry dist filename expected_hash destination kexec_path libdirs
 	[[ -n "$KEXEC_BIN" ]] && return 0
 	if KEXEC_BIN=$(command_path kexec); then
 		return 0
@@ -193,13 +206,13 @@ ensure_host_kexec() {
 	load_debian_indexes
 	resolve_debian_packages kexec-tools
 	for entry in "${RESOLVED_DEBS[@]}"; do
-		dist=${entry%% *}
-		filename=${entry#* }
+		IFS=$'\t' read -r dist filename expected_hash <<< "$entry"
 		destination="$WORKDIR/debs/$(basename "$filename")"
 		if [[ ! -s "$destination" ]]; then
 			printf 'Downloading Debian %s package: %s\n' "$dist" "$DI_MIRROR/$filename"
 			download_file "$DI_MIRROR/$filename" "$destination"
 		fi
+		verify_debian_package "$destination" "$expected_hash" "$filename"
 		extract_package_into "$destination" "$WORKDIR/hostbin"
 	done
 	kexec_path=$(find "$WORKDIR/hostbin" -type f -name kexec -perm -u+x 2>/dev/null | head -n1)
@@ -339,6 +352,7 @@ finalize_initramfs() {
 		printf 'IMAGE_RAW_URL=%q\n' "$IMAGE_RAW_URL"
 		printf 'IMAGE_SHA256=%q\n' "$IMAGE_SHA256"
 		printf 'IMAGE_SIZE=%q\n' "$IMAGE_SIZE"
+		printf 'VERIFY_IMAGE=%q\n' "$VERIFY_IMAGE"
 		printf 'SCRATCH_OFFSET=%q\n' "$SCRATCH_OFFSET"
 		printf 'SCRATCH_BYTES=%q\n' "$SCRATCH_BYTES"
 		printf 'DROPBEAR_BIN=%q\n' "$DROPBEAR_BIN"
@@ -420,6 +434,8 @@ parse_args() {
 			--image-file) IMAGE_FILE=${2:?missing value for --image-file}; shift 2 ;;
 			--image-raw-url) IMAGE_URL=${2:?missing value for --image-raw-url}; shift 2 ;;
 			--sha256) IMAGE_SHA256=${2:?missing value for --sha256}; shift 2 ;;
+			--verify-image) VERIFY_IMAGE=1; shift ;;
+			--no-verify-image) VERIFY_IMAGE=0; shift ;;
 			--image-size) IMAGE_SIZE=${2:?missing value for --image-size}; shift 2 ;;
 			--disk) TARGET_DISK=${2:?missing value for --disk}; shift 2 ;;
 			--hostname) TARGET_HOSTNAME=${2:?missing value for --hostname}; shift 2 ;;
@@ -435,6 +451,8 @@ parse_args() {
 			--reboot-delay) REBOOT_DELAY=${2:?missing value for --reboot-delay}; shift 2 ;;
 			--kernel) KEXEC_KERNEL=${2:?missing value for --kernel}; shift 2 ;;
 			--ramdisk-source) RAMDISK_SOURCE=${2:?missing value for --ramdisk-source}; shift 2 ;;
+			--verify-debian-packages) VERIFY_DEBIAN_PACKAGES=1; shift ;;
+			--no-verify-debian-packages) VERIFY_DEBIAN_PACKAGES=0; shift ;;
 			--di-mirror) DI_MIRROR=${2:?missing value for --di-mirror}; shift 2 ;;
 			--di-suite) DI_SUITE=${2:?missing value for --di-suite}; shift 2 ;;
 			--di-arch) DI_ARCH=${2:?missing value for --di-arch}; shift 2 ;;
@@ -452,6 +470,8 @@ parse_args() {
 main() {
 	parse_args "$@"
 	[[ $EUID -eq 0 ]] || die 'run as root'
+	[[ "$VERIFY_DEBIAN_PACKAGES" == 0 || "$VERIFY_DEBIAN_PACKAGES" == 1 ]] || \
+		die "invalid Debian package verification setting: $VERIFY_DEBIAN_PACKAGES (use 0 or 1)"
 	resolve_ramdisk_source
 	resolve_image_mode
 	check_dependencies

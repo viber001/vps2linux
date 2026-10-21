@@ -20,7 +20,8 @@ Options:
   --image-url URL       Raw image URL (default: streamed to the target disk).
                         A .squashfs URL needs disk or embed mode.
   --image-file FILE     Local raw image or SquashFS file (used with embed mode)
-  --sha256 HASH         Expected SHA-256 of the raw image
+  --sha256 HASH         Expected SHA-256 of the raw image (required by default)
+  --no-verify-image     Explicitly disable raw-image SHA-256 verification
   --image-size BYTES    Expected raw image size; auto-detected from the HTTP
                         Content-Length when omitted (stream mode)
   --disk DEVICE         Target whole disk (default: disk containing /)
@@ -31,7 +32,10 @@ Options:
   --dns ADDRESS         DNS server(s), separated by commas or semicolons
   --user NAME           Login user created by Combustion (default: root)
   --password VALUE      Password for --user; when set, password SSH login is
-                        enabled as well as the SSH key
+                        enabled as well as the SSH key. This is a temporary
+                        bootstrap password: Combustion uses set -x, so it can
+                        appear in the Combustion log; reboot and change it
+                        immediately after confirming the target is reachable.
   --ssh-key-file FILE   authorized_keys source (default: /root/.ssh/authorized_keys)
   --root-size-gib N     Btrfs partition size (default: 64)
   --config-size-mib N   Minimum Combustion partition size (default: 1024);
@@ -43,14 +47,17 @@ Options:
   --ramdisk-source SRC  Where the deploy ramdisk userspace comes from:
                         auto (default): stage the running host's tools when the
                         host already has them all, otherwise download the Debian
-                        installer (d-i) components over HTTP;
+                        installer (d-i) components over HTTPS;
                         host: force the host tools, fail if any are missing;
-                        debian: force the HTTP download, needing no host package
+                        debian: force the HTTPS download, needing no host package
                         manager (for a non-apt source host such as Leap Micro);
                         apt: install the missing host tools with apt-get, then
                         stage the host (apt-based hosts only)
+  --no-verify-debian-packages
+                        Skip SHA-256 verification from Debian Packages indexes
+                        (verification is enabled by default)
   --di-mirror URL       Debian mirror for the installer components
-                        (default: http://deb.debian.org/debian)
+                        (default: https://deb.debian.org/debian)
   --di-suite NAME       Debian suite the installer components come from
                         (default: stable)
   --di-arch NAME        Debian architecture (default: amd64)
@@ -84,12 +91,14 @@ Examples:
     --ipv4 192.0.2.20/24 --gateway 192.0.2.1 --dns 192.0.2.53
 
   $PROGRAM --stage-test \\
-    --image-url http://10.68.247.224:18080/openSUSE-Leap-Micro.raw
+    --image-url http://10.68.247.224:18080/openSUSE-Leap-Micro.raw \\
+    --sha256 <raw-image-sha256>
 
 The configuration partition uses the Leap Micro Combustion contract:
 filesystem label "combustion" and /combustion/script. It is not a generic
 cloud-init disk; the script writes the user, password, hostname, networking
-and SSH keys.
+and SSH keys. OpenSSH authorized_keys is a text file; only the key body is
+base64. The reserved heredoc marker lines SSHKEYS/USERKEYS and the generated
+markers are rejected before execution.
 EOF
 }
-

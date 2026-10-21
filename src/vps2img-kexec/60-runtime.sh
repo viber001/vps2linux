@@ -69,7 +69,7 @@ check_kexec_support() {
 	if ! KEXEC_BIN=$(command_path kexec); then
 		KEXEC_BIN=
 		# The host-side kernel switch still needs a kexec binary.  Debian mode
-		# fetches kexec-tools over HTTP in ensure_host_kexec instead of using
+		# fetches kexec-tools over the configured Debian mirror in ensure_host_kexec instead of using
 		# the host package manager; host mode requires it to be installed.
 		[[ "$RAMDISK_SOURCE" == debian ]] || die 'required command is missing: kexec'
 	fi
@@ -103,9 +103,13 @@ print_plan() {
 		printf 'image source:    %s (unpacked on the source, staged on a %s MiB scratch area at the end of the target disk)\n' \
 			"${IMAGE_URL:-$IMAGE_FILE}" "$(( ${SCRATCH_BYTES:-0} / 1048576 ))"
 	else
-		printf 'image source:    %s (embedded in initramfs, %s bytes)\n' "$RAW_FILE" "$size_bytes"
+	printf 'image source:    %s (embedded in initramfs, %s bytes)\n' "$RAW_FILE" "$size_bytes"
 	fi
-	printf 'image sha256:    %s\n' "${IMAGE_SHA256:-none (not verified)}"
+	if [[ "$VERIFY_IMAGE" == 1 ]]; then
+		printf 'image sha256:    %s (verification enabled)\n' "$IMAGE_SHA256"
+	else
+		printf '%s\n' 'image sha256:    verification disabled (--no-verify-image)'
+	fi
 	(#@INCLUDE@expand) src/assets/plan-target.sh
 	(#@INCLUDE@expand) src/assets/plan-disk.sh
 	if [[ "$IMAGE_MODE" == embed ]]; then
@@ -123,22 +127,23 @@ print_plan() {
 
 check_dependencies() {
 	local command_name archive
-	for command_name in awk blockdev cp cpio find findmnt gzip lsblk mount readlink rm sha256sum sfdisk stat sync tar tr umount; do
+	for command_name in awk blockdev cp cpio find findmnt grep gzip lsblk mount readlink rm sha256sum sfdisk stat sync tar tr umount; do
 		need_command "$command_name"
 	done
 	for command_name in hostname ip modinfo modprobe mountpoint paste sort; do
 		need_command "$command_name"
 	done
 	if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-		die 'curl or wget is required to download over HTTP'
+		die 'curl or wget is required to download the configured image or Debian components'
 	fi
 	# The host ramdisk source stages the running host's tools, so it needs them
-	# on the host.  The Debian source fetches every staged file over HTTP, so
+	# on the host.  The Debian source fetches every staged file over the configured
+	# mirror, so
 	# the host only needs the archive tooling above; kexec is prepared later by
 	# ensure_host_kexec and never through the host package manager.
 	if [[ "$RAMDISK_SOURCE" == host ]]; then
 		for command_name in busybox dropbearkey sgdisk; do
-			command -v "$command_name" >/dev/null 2>&1 || die "required command is missing: $command_name (install it, or use --ramdisk-source auto or debian to fetch the tools over HTTP)"
+			command -v "$command_name" >/dev/null 2>&1 || die "required command is missing: $command_name (install it, or use --ramdisk-source auto or debian to fetch the tools)"
 		done
 	fi
 	# embed and disk both unpack a SquashFS archive on the source host; only
@@ -215,7 +220,7 @@ resolve_ramdisk_source() {
 				printf '%s\n' 'Ramdisk source: the host already provides every tool; staging the host.'
 				RAMDISK_SOURCE=host
 			else
-				printf 'Ramdisk source: the host lacks %s; fetching the Debian installer components over HTTP.\n' \
+				printf 'Ramdisk source: the host lacks %s; fetching the Debian installer components over HTTPS.\n' \
 					"$(printf '%s ' $missing | sed 's/ $//')"
 				RAMDISK_SOURCE=debian
 			fi
@@ -394,9 +399,13 @@ bring_up_network() {
 }
 
 verify_image() {
-	if [ -z "${IMAGE_SIZE:-}" ] || [ -z "${IMAGE_SHA256:-}" ]; then
-		log 'WARNING: image size or checksum missing; skipping verification'
+	if [ "${VERIFY_IMAGE:-1}" != 1 ]; then
+		log 'WARNING: image SHA-256 verification was explicitly disabled'
 		return 0
+	fi
+	if [ -z "${IMAGE_SIZE:-}" ] || [ -z "${IMAGE_SHA256:-}" ]; then
+		log 'ERROR: image size or checksum missing while verification is enabled'
+		return 1
 	fi
 	log "verifying $IMAGE_SIZE bytes read back from $DISK"
 	local actual

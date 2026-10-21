@@ -18,3 +18,9 @@
 	[[ "$CONFIG_SIZE_MIB" =~ ^[1-9][0-9]*$ ]] || die "invalid config size: $CONFIG_SIZE_MIB MiB"
 	[[ "$REBOOT_DELAY" =~ ^[0-9]+$ ]] || die "invalid reboot delay: $REBOOT_DELAY seconds"
 	[[ -s "$SSH_KEY_FILE" ]] || die "SSH authorized_keys file is missing or empty: $SSH_KEY_FILE"
+	for marker in SSHKEYS USERKEYS \
+		__VPS2IMG_ROOT_AUTHORIZED_KEYS__ __VPS2IMG_USER_AUTHORIZED_KEYS__; do
+		if grep -Fqx -- "$marker" "$SSH_KEY_FILE"; then
+			die "authorized_keys file contains the reserved line '$marker': remove or change that line before running"
+		fi
+	done

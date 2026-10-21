@@ -3,8 +3,8 @@
 本文件记录 `vps2img-pivot` / `vps2img-kexec` 写到 Combustion 分区（`sda4`，`LABEL=combustion`）的 `/combustion/script`，用于分析目标系统**首启时**的行为，尤其是扩容与 10 MiB 空洞的配合。
 
 - 源片段：`src/assets/combustion.sh`（3 行 INCLUDE）→ `combustion-base.sh` + `combustion-user.sh` + `combustion-growroot.sh`。
-- 注入方式：两个部署器都在内层 deployer 里用 `(#@HEREDOC@expand) cat > /config/combustion/script <<COMBUSTION | src/assets/combustion.sh`，因此 `@PROGRAM@`、`$TARGET_*`、`$AUTHORIZED_KEYS` 在**部署时**替换为字面量；`\$ROOT` 等转义保留为脚本运行时展开。
-- 两个部署器生成的脚本**除程序名外完全一致**（`diff` 仅 6 处 `vps2img-pivot` ↔ `vps2img-kexec`）。
+- 注入方式：两个部署器都在内层 deployer 里用 `(#@HEREDOC@expand) cat > /config/combustion/script <<COMBUSTION | src/assets/combustion.sh`，因此 `@PROGRAM@`、`$TARGET_*`、`$AUTHORIZED_KEYS` 在**部署时**替换为字面量；`\$ROOT` 等转义保留为脚本运行时展开。为避免 authorized key 内容提前结束嵌套 heredoc，部署前会拒绝整行 `SSHKEYS`、`USERKEYS` 及当前使用的 marker；key 文件是文本，只有 OpenSSH key body 是 base64。
+- 两个部署器生成的脚本**除程序名外完全一致**（`diff` 仅 6 处 `vps2img-pivot` ↔ `vps2img-kexec`）。密码只应作为临时 bootstrap credential：脚本使用 `set -x`，密码可能出现在 Combustion journal/log 中；目标系统重启并确认 SSH 可用后必须立即修改密码。
 - 下面正文保留 `@PLACEHOLDER@` 形式，代表部署时会被替换的部分。
 
 ## 生成结果（完整）
@@ -109,9 +109,9 @@ NETWORK
 	chmod 600 "$ROOT/etc/NetworkManager/system-connections/@PROGRAM@.nmconnection"
 
 mkdir -p "$ROOT/root/.ssh"
-cat > "$ROOT/root/.ssh/authorized_keys" <<'SSHKEYS'
+cat > "$ROOT/root/.ssh/authorized_keys" <<'__VPS2IMG_ROOT_AUTHORIZED_KEYS__'
 $AUTHORIZED_KEYS
-SSHKEYS
+__VPS2IMG_ROOT_AUTHORIZED_KEYS__
 chmod 700 "$ROOT/root/.ssh"
 chmod 600 "$ROOT/root/.ssh/authorized_keys"
 
@@ -157,9 +157,9 @@ ensure_user() {
 	[[ -n "$home" ]] || home=/root
 	uid_gid=$(awk -F: -v u="$user" '$1==u{print $3":"$4}' "$ROOT/etc/passwd")
 	mkdir -p "$ROOT$home/.ssh"
-	cat > "$ROOT$home/.ssh/authorized_keys" <<'USERKEYS'
+	cat > "$ROOT$home/.ssh/authorized_keys" <<'__VPS2IMG_USER_AUTHORIZED_KEYS__'
 $AUTHORIZED_KEYS
-USERKEYS
+__VPS2IMG_USER_AUTHORIZED_KEYS__
 	chmod 700 "$ROOT$home/.ssh"
 	chmod 600 "$ROOT$home/.ssh/authorized_keys"
 	if [[ -n "$uid_gid" ]]; then
@@ -172,9 +172,9 @@ USERKEYS
 	# (AuthorizedKeysFile drop-in below); a firstboot unit recreates the real
 	# ~/.ssh on the /home subvolume.
 	mkdir -p "$ROOT/etc/ssh/authorized_keys.d"
-	cat > "$ROOT/etc/ssh/authorized_keys.d/$user" <<'USERKEYS'
+	cat > "$ROOT/etc/ssh/authorized_keys.d/$user" <<'__VPS2IMG_USER_AUTHORIZED_KEYS__'
 $AUTHORIZED_KEYS
-USERKEYS
+__VPS2IMG_USER_AUTHORIZED_KEYS__
 	chmod 644 "$ROOT/etc/ssh/authorized_keys.d/$user"
 	chown root:root "$ROOT/etc/ssh/authorized_keys.d/$user"
 	chmod 755 "$ROOT/etc/ssh/authorized_keys.d"
@@ -244,7 +244,7 @@ fi
 
 1. initrd 挂载镜像 root 到 `/sysroot`（Leap Micro 的 `root=` 由镜像自带 cmdline 决定）。
 2. systemd 在 `sysroot.mount` 之后、`multi-user.target` 之前运行 `combustion.service`，执行 `/combustion/script`。
-3. 脚本以 `set -euxo pipefail` 运行；**`-x` 会把每条命令写进 journal**（`journalctl -b -u combustion`），这是排查首启行为的第一入口。
+3. 脚本以 `set -euxo pipefail` 运行；**`-x` 会把每条命令写进 journal**（`journalctl -b -u combustion`），包括可能包含密码的命令。因此 `--password` 只能使用临时密码，目标重启并确认 SSH 可用后应立即修改，不要复用正式密码。
 4. `/combustion` 即 `sda4`（`LABEL=combustion`）。成功的首启会消费该分区：实测第二次启动时 `/combustion` 已不存在。
 5. 脚本里的写入走 `transactional-update` 语义，journal 可见 `Warning: The following files were changed in the snapshot, but are shadowed by other mounts`（`/.snapshots/2/snapshot/home/leap/...`），属预期提示。
 

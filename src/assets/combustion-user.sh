@@ -24,9 +24,9 @@ ensure_user() {
 	[[ -n "\$home" ]] || home=/root
 	uid_gid=\$(awk -F: -v u="\$user" '\$1==u{print \$3":"\$4}' "\$ROOT/etc/passwd")
 	mkdir -p "\$ROOT\$home/.ssh"
-	cat > "\$ROOT\$home/.ssh/authorized_keys" <<'USERKEYS'
+	cat > "\$ROOT\$home/.ssh/authorized_keys" <<'__VPS2IMG_USER_AUTHORIZED_KEYS__'
 $AUTHORIZED_KEYS
-USERKEYS
+__VPS2IMG_USER_AUTHORIZED_KEYS__
 	chmod 700 "\$ROOT\$home/.ssh"
 	chmod 600 "\$ROOT\$home/.ssh/authorized_keys"
 	if [[ -n "\$uid_gid" ]]; then
@@ -39,9 +39,9 @@ USERKEYS
 	# (AuthorizedKeysFile drop-in below); a firstboot unit recreates the real
 	# ~/.ssh on the /home subvolume.
 	mkdir -p "\$ROOT/etc/ssh/authorized_keys.d"
-	cat > "\$ROOT/etc/ssh/authorized_keys.d/\$user" <<'USERKEYS'
+	cat > "\$ROOT/etc/ssh/authorized_keys.d/\$user" <<'__VPS2IMG_USER_AUTHORIZED_KEYS__'
 $AUTHORIZED_KEYS
-USERKEYS
+__VPS2IMG_USER_AUTHORIZED_KEYS__
 	chmod 644 "\$ROOT/etc/ssh/authorized_keys.d/\$user"
 	chown root:root "\$ROOT/etc/ssh/authorized_keys.d/\$user"
 	chmod 755 "\$ROOT/etc/ssh/authorized_keys.d"

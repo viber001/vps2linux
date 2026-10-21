@@ -97,9 +97,9 @@ NETWORK
 	chmod 600 "\$ROOT/etc/NetworkManager/system-connections/@PROGRAM@.nmconnection"
 
 mkdir -p "\$ROOT/root/.ssh"
-cat > "\$ROOT/root/.ssh/authorized_keys" <<'SSHKEYS'
+cat > "\$ROOT/root/.ssh/authorized_keys" <<'__VPS2IMG_ROOT_AUTHORIZED_KEYS__'
 $AUTHORIZED_KEYS
-SSHKEYS
+__VPS2IMG_ROOT_AUTHORIZED_KEYS__
 chmod 700 "\$ROOT/root/.ssh"
 chmod 600 "\$ROOT/root/.ssh/authorized_keys"
 
@@ -118,4 +118,3 @@ fi
 if [[ -f "\$ROOT/etc/sysconfig/bootloader" ]] && ! grep -q 'console=tty0' "\$ROOT/etc/sysconfig/bootloader"; then
 	sed -i 's/^\(DEFAULT_APPEND="[^"]*\)"/\1 console=tty0"/; s/^\(FAILSAFE_APPEND="[^"]*\)"/\1 console=tty0"/' "\$ROOT/etc/sysconfig/bootloader"
 fi
-

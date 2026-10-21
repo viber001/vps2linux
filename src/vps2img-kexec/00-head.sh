@@ -43,6 +43,7 @@ IMAGE_URL=${VPS2IMG_KEXEC_IMAGE_URL:-}
 IMAGE_FILE=${VPS2IMG_KEXEC_IMAGE_FILE:-}
 IMAGE_SHA256=${VPS2IMG_KEXEC_IMAGE_SHA256:-}
 IMAGE_SIZE=${VPS2IMG_KEXEC_IMAGE_SIZE:-}
+VERIFY_IMAGE=${VPS2IMG_KEXEC_VERIFY_IMAGE:-1}
 IMAGE_MODE_REQUEST=${VPS2IMG_KEXEC_IMAGE_MODE:-auto}
 TARGET_DISK=${VPS2IMG_KEXEC_DISK:-}
 TARGET_HOSTNAME=${VPS2IMG_KEXEC_HOSTNAME:-}
@@ -104,12 +105,13 @@ INITRAMFS=$WORKDIR/initramfs.cpio.gz
 # userspace of the ramdisk is replaced.
 # Where the deploy ramdisk userspace comes from (see resolve_ramdisk_source):
 #   auto   (default) use the host tools when the host has them all, otherwise
-#          fetch the Debian installer components over HTTP
+#          fetch the Debian installer components over HTTPS
 #   host   force staging the running host's tools; fail if any are missing
-#   debian force the HTTP download (needs no host package manager)
+#   debian force the HTTPS download (needs no host package manager)
 #   apt    install the missing host tools with apt-get, then stage the host
 RAMDISK_SOURCE=${VPS2IMG_KEXEC_RAMDISK_SOURCE:-auto}
-DI_MIRROR=${VPS2IMG_KEXEC_DI_MIRROR:-http://deb.debian.org/debian}
+VERIFY_DEBIAN_PACKAGES=${VPS2IMG_KEXEC_VERIFY_DEBIAN_PACKAGES:-1}
+DI_MIRROR=${VPS2IMG_KEXEC_DI_MIRROR:-https://deb.debian.org/debian}
 DI_SUITE=${VPS2IMG_KEXEC_DI_SUITE:-stable}
 DI_ARCH=${VPS2IMG_KEXEC_DI_ARCH:-amd64}
 # Static busybox used only as a last-resort ar reader (see ar_command).  The
@@ -120,7 +122,7 @@ DI_DEB_INDEX=$WORKDIR/di-index-deb.txt
 DI_UDEB_INDEX=$WORKDIR/di-index-udeb.txt
 declare -A DI_PKG_FILE=()
 declare -A DI_PKG_DEP=()
+declare -A DI_PKG_SHA256=()
 declare -A DI_PKG_DISTS=()
 declare -A DI_INDEX_PARSED=()
 RESOLVED_DEBS=()
-

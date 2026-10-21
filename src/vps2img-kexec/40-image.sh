@@ -53,6 +53,18 @@ last_used_end() {
 GPT_RESERVED_SECTORS=34
 SCRATCH_ALIGN_SECTORS=2048
 
+check_image_verification() {
+	case "$VERIFY_IMAGE" in
+		0) warn 'raw-image SHA-256 verification disabled by --no-verify-image' ;;
+		1)
+			[[ "$IMAGE_SHA256" =~ ^[0-9A-Fa-f]{64}$ ]] || \
+				die 'raw-image SHA-256 verification is enabled; pass a 64-hex --sha256 value or use --no-verify-image explicitly'
+			IMAGE_SHA256=$(printf '%s' "$IMAGE_SHA256" | tr '[:upper:]' '[:lower:]')
+			;;
+		*) die "invalid image verification setting: $VERIFY_IMAGE (use 0 or 1)" ;;
+	esac
+}
+
 resolve_image_mode() {
 	case "$IMAGE_MODE_REQUEST" in
 		stream|embed|disk)
@@ -140,6 +152,7 @@ stage_image_on_disk() {
 prepare_image() {
 	local archive raw_candidate extract raw_size mem_available
 	mkdir -p "$WORKDIR"
+	check_image_verification
 
 	if [[ "$IMAGE_MODE" == stream ]]; then
 		[[ -n "$IMAGE_URL" ]] || die 'stream mode requires --image-url pointing to a raw image'
@@ -152,7 +165,6 @@ prepare_image() {
 		[[ "$IMAGE_SIZE" =~ ^[1-9][0-9]*$ ]] || \
 			die 'cannot determine the raw image size from Content-Length; pass --image-size'
 		RAW_SIZE=$IMAGE_SIZE
-		[[ -n "$IMAGE_SHA256" ]] || warn 'no --sha256 given; the streamed image will not be verified'
 		return 0
 	fi
 
@@ -178,8 +190,11 @@ prepare_image() {
 		[[ "$archive" == "$RAW_FILE" ]] || cp -f "$archive" "$RAW_FILE"
 		[[ -s "$RAW_FILE" ]] || die 'the raw image is empty'
 		RAW_SIZE=$(stat -c '%s' "$RAW_FILE")
+		IMAGE_SIZE=$RAW_SIZE
 		if [[ -n "$IMAGE_SHA256" ]]; then
-			printf '%s  %s\n' "$IMAGE_SHA256" "$RAW_FILE" | sha256sum -c -
+			if [[ "$VERIFY_IMAGE" == 1 ]]; then
+				printf '%s  %s\n' "$IMAGE_SHA256" "$RAW_FILE" | sha256sum -c -
+			fi
 		fi
 		return 0
 	fi
@@ -214,7 +229,9 @@ prepare_image() {
 		DISK_RAW_SOURCE=$raw_candidate
 		RAW_SIZE=$raw_size
 		IMAGE_SIZE=$raw_size
-		[[ -n "$IMAGE_SHA256" ]] || warn 'no --sha256 given; the written image will not be verified'
+		if [[ "$VERIFY_IMAGE" == 1 ]]; then
+			printf '%s  %s\n' "$IMAGE_SHA256" "$raw_candidate" | sha256sum -c -
+		fi
 		return 0
 	fi
 
@@ -224,7 +241,8 @@ prepare_image() {
 	mv -f "$raw_candidate" "$RAW_FILE"
 	[[ -s "$RAW_FILE" ]] || die 'the extracted raw image is empty'
 	RAW_SIZE=$(stat -c '%s' "$RAW_FILE")
-	if [[ -n "$IMAGE_SHA256" ]]; then
+	IMAGE_SIZE=$RAW_SIZE
+	if [[ -n "$IMAGE_SHA256" && "$VERIFY_IMAGE" == 1 ]]; then
 		printf '%s  %s\n' "$IMAGE_SHA256" "$RAW_FILE" | sha256sum -c -
 	fi
 }

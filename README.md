@@ -23,7 +23,7 @@ iVentoy 的 PXE 流程不直接支持这个 SelfInstall ISO，因此本项目采
 http://10.68.247.14:16000/eiso/id/3/
 ```
 
-该目录由 iVentoy 提供，镜像的具体 URL 和 SHA256 作为命令行参数传入，不在脚本中固定。
+该目录由 iVentoy 提供，镜像的具体 URL 和 SHA256 作为命令行参数传入，不在脚本中固定。默认必须提供 raw image 的 SHA256；只有显式使用 `--no-verify-image` 才会跳过校验。
 
 ## 设计原则
 
@@ -105,19 +105,21 @@ pivot 的旧系统在部署期间仍存活，旧 sshd 一直占着 22。若源�
 
 - 内核需支持 kexec（`kexec_load` 自 Linux 2.6.13，`kexec_file_load` 自 3.17）：物理机、KVM/Xen/HN 可用，容器（OpenVZ/LXC）不可用。
 - 默认用 `kexec_file_load`（`kexec -s -l`）加载**当前正在运行的内核**，因此 **Secure Boot 可以保持开启**（lockdown 只禁止旧的 `kexec_load`）。仅当 `-s` 失败且系统未处于 lockdown 时才回退到 `kexec -c -l`；`--kernel` 指定未签名内核时仍需关闭 Secure Boot。
-- ramdisk 用户态默认 `--ramdisk-source auto`：宿主工具齐全时 staging 宿主，否则经 HTTP 下载 d-i 组件组装。宿主至少需要 `cpio`、`gzip`、`gdisk`/`sgdisk`（`--image-mode stream` 直接流式写 raw image，不需要 `squashfs-tools`；`embed`/`disk` 对 SquashFS 源需要在宿主上有 `unsquashfs`）。详见下文。
+- ramdisk 用户态默认 `--ramdisk-source auto`：宿主工具齐全时 staging 宿主，否则经 HTTPS 下载 d-i 组件组装。宿主至少需要 `cpio`、`gzip`、`gdisk`/`sgdisk`（`--image-mode stream` 直接流式写 raw image，不需要 `squashfs-tools`；`embed`/`disk` 对 SquashFS 源需要在宿主上有 `unsquashfs`）。详见下文。
 - initramfs 按整条设备链收集在用驱动模块（`lsmod` + 目标磁盘/网卡驱动闭包）和固件，以便在物理机上启动；内核内置的驱动自动跳过。
 - initramfs 内置 **dropbear 救援 shell，监听 22 端口**：拉起网络后即启动（成功写盘前与失败路径都保留），仅允许 root 公钥登录（`--ssh-key-file`），host key 为构建时临时生成，故每次部署的指纹都不同。
 
 默认 `--image-mode auto`：源是 raw URL 时用 `stream`，否则（SquashFS 源）解压后按可用内存选择 `embed` 或 `disk`。
 
-- `stream`：initramfs 保持极小（busybox + 少量工具，几 MB），raw image 通过 HTTP 直接流式写入目标盘（`wget -O - <url> | dd of=<disk> bs=4M`），任何时候都不把整块 image 放进 RAM；随后从目标盘回读前 `--image-size` 字节做 SHA-256 校验（未给出 `--image-size` 时用 HTTP `Content-Length` 推导）。
+- `stream`：initramfs 保持极小（busybox + 少量工具，几 MB），raw image 通过 HTTP 直接流式写入目标盘（`wget -O - <url> | dd of=<disk> bs=4M`），任何时候都不把整块 image 放进 RAM；随后从目标盘回读前 `--image-size` 字节做 SHA-256 校验（未给出 `--image-size` 时用 HTTP `Content-Length` 推导）。`--sha256` 默认必填；仅在明确接受风险时使用 `--no-verify-image`。
 - `embed`：在原系统解压 SquashFS，把整块 raw image 内嵌进 initramfs（内存 staging，非常耗内存，需确保内存放得下 raw image）。
 - `disk`：在原系统解压 SquashFS，把 raw image 放到目标盘末尾的 ext4 scratch 区（盘尾空余空间内，不写 GPT 分区，用 loop 设备访问），initramfs 再从 scratch 拷回盘首写入。scratch 区位于 raw image 之上，写盘永远不会覆盖正在读取的 scratch；最终 deploy 会依据 raw image 重建 GPT，scratch 随之消失。压缩源始终先下载到磁盘，绝不落到内存。
 
 `--scratch-mib N` 可覆盖 `disk` 模式的 scratch 区大小（默认用最后一个分区之后的全部空余空间）。磁盘 mode 已在 VM 602（400G 盘、4G 内存）端到端验证：`auto` 正确选择 `disk`，重启后为 `pve2-leap-test`（root 64G btrfs、combustion 分区、静态网络、`leap` wheel sudo/SSH 全部生效，Btrfs 无错误）。
 
-Combustion 的 `/combustion/script` 会配置登录用户名、密码、SSH key、hostname、静态 IPv4/网关/DNS，并启用 `sshd` 和 `NetworkManager`。用户名通过 `--user` 指定（默认 `root`），密码通过 `--password` 指定（可选，设置后同时开启公钥和密码登录）。
+Combustion 的 `/combustion/script` 会配置登录用户名、密码、SSH key、hostname、静态 IPv4/网关/DNS，并启用 `sshd` 和 `NetworkManager`。用户名通过 `--user` 指定（默认 `root`），密码通过 `--password` 指定（可选，设置后同时开启公钥和密码登录）。密码只应作为临时 bootstrap 密码：Combustion 使用 `set -x`，密码可能出现在 Combustion 日志中；目标系统重启并确认 SSH 可用后，应立即修改密码，不要复用正式密码。
+
+`authorized_keys` 是文本文件，只有 OpenSSH key 行中的 key body 是 base64，文件本身不是 base64。为避免嵌套 heredoc 分隔符碰撞，部署器会拒绝 key 文件中整行的 `SSHKEYS`、`USERKEYS` 或保留 marker；发现后请先删除或修改该整行再运行。
 
 与 `vps2img-pivot` 相同：默认只生成只读计划；破坏性执行必须同时提供 `--execute` 和环境变量 `VPS2IMG_KEXEC_CONFIRM=WIPE:<disk>`。`--stage-test` 只构建 initramfs 并 `kexec -l` 装载再卸载，不切换内核。
 
@@ -143,16 +145,16 @@ VPS2IMG_KEXEC_CONFIRM=WIPE:/dev/sda \
 
 部署 ramdisk 的用户态来源可选，按需选择：
 
-- `auto`（默认）：宿主已具备全部所需工具时 staging 宿主（等价 `host`），否则自动改为经 HTTP 下载组装（等价 `debian`）。
+- `auto`（默认）：宿主已具备全部所需工具时 staging 宿主（等价 `host`），否则自动改为经 HTTPS 下载组装（等价 `debian`）。
 - `host`：强制 staging 运行中的宿主（`busybox`/`dropbear`/`kexec`/`sgdisk` 等）；缺任一工具则报错。
-- `debian`：强制从 Debian 安装器（d-i）的 netboot initrd 与普通 `.deb/.udeb` 经 HTTP 获取并自行组装，完全不经过宿主包管理器，适用于非 apt 源（如 openSUSE Leap Micro）。
+- `debian`：强制从 Debian 安装器（d-i）的 netboot initrd 与普通 `.deb/.udeb` 经 HTTPS 获取并自行组装，完全不经过宿主包管理器，适用于非 apt 源（如 openSUSE Leap Micro）。Debian `Packages` 索引中的 SHA256 默认会校验每个 `.deb/.udeb`；仅在明确接受风险时使用 `--no-verify-debian-packages`。
 - `apt`：先用 `apt-get` 补齐缺失的宿主工具，再 staging 宿主（仅 apt 宿主可用；`apt-get update` 失败仅告警，便于无订阅的 PVE 源）。
 
 kexec 始终加载**正在运行的内核**，替换的只是 ramdisk 用户态，内核与模块始终匹配。
 
 读 `.deb/.udeb` 需要 `ar`；若宿主没有 `ar`（如 Leap Micro 无 binutils），依次回退到宿主 busybox 的 `ar` applet、再回退到下载 busybox.net 发布的静态 busybox，因此无需任何宿主包。
 
-`--di-mirror`（默认 `http://deb.debian.org/debian`）、`--di-suite`（默认 `stable`）、`--di-arch`（默认 `amd64`）选择 d-i 源。`debian`/`auto` 路径已在 openSUSE Leap Micro 源（无 apt、无 ar）上端到端验证，`apt` 路径已在 PVE Debian 源上验证。
+`--di-mirror`（默认 `https://deb.debian.org/debian`）、`--di-suite`（默认 `stable`）、`--di-arch`（默认 `amd64`）选择 d-i 源。`stable` 会随 Debian 发布推进，不承诺永久固定 busybox/dropbear 历史版本；需要可重现的旧版本时，请指定固定 suite/内部镜像或使用 <https://snapshot.debian.org/> 的历史快照，并保留对应 hash。`debian`/`auto` 路径已在 openSUSE Leap Micro 源（无 apt、无 ar）上端到端验证，`apt` 路径已在 PVE Debian 源上验证。
 
 ```bash
 VPS2IMG_KEXEC_CONFIRM=WIPE:/dev/sda \

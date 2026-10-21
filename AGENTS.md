@@ -150,7 +150,7 @@ sda4  ext4，label=combustion，扩展到磁盘末尾，不留空闲空间
 
 现状：`vps2img-kexec` 已实现并用同一 `--execute`/`VPS2IMG_KEXEC_CONFIRM` 双重保护上线。要点：kexec 需要内核支持，且加载的内核与 initramfs 必须匹配；initramfs 必须自带 GPT 和文件系统工具；网络下载需要 initramfs 内有网卡驱动和静态网络配置。
 
-initramfs 用户态由 `--ramdisk-source auto|host|debian|apt` 决定：`auto`（默认）在宿主工具齐全时 staging 宿主，否则经 HTTP 获取 d-i 组件；`debian` 强制 HTTP 组装（无需宿主包管理器，适用 Leap Micro 等非 apt 源）；`apt` 先用 `apt-get` 补齐缺失工具再 staging 宿主。读 `.deb/.udeb` 的 `ar` 缺失时回退 busybox applet，再回退下载 busybox.net 静态 busybox。
+initramfs 用户态由 `--ramdisk-source auto|host|debian|apt` 决定：`auto`（默认）在宿主工具齐全时 staging 宿主，否则经 HTTPS 获取 d-i 组件；`debian` 强制 HTTPS 组装（无需宿主包管理器，适用 Leap Micro 等非 apt 源）；Debian `Packages` 索引中的 SHA256 默认校验 `.deb/.udeb`，可用 `--no-verify-debian-packages` 显式关闭；`apt` 先用 `apt-get` 补齐缺失工具再 staging 宿主。读 `.deb/.udeb` 的 `ar` 缺失时回退 busybox applet，再回退下载 busybox.net 静态 busybox。
 
 ## 安全规则
 

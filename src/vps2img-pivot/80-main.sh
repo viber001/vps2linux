@@ -85,6 +85,8 @@ parse_args() {
 			--image-url) IMAGE_URL=${2:?missing value for --image-url}; shift 2 ;;
 			--image-file) IMAGE_FILE=${2:?missing value for --image-file}; shift 2 ;;
 			--sha256) IMAGE_SHA256=${2:?missing value for --sha256}; shift 2 ;;
+			--verify-image) VERIFY_IMAGE=1; shift ;;
+			--no-verify-image) VERIFY_IMAGE=0; shift ;;
 			--disk) TARGET_DISK=${2:?missing value for --disk}; shift 2 ;;
 			--hostname) TARGET_HOSTNAME=${2:?missing value for --hostname}; shift 2 ;;
 			--interface) TARGET_INTERFACE=${2:?missing value for --interface}; shift 2 ;;

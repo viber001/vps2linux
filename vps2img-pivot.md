@@ -61,6 +61,12 @@ RAM bootstrap 内层部署
 
 目标首启由镜像自带引导程序启动，dracut 的 `35combustion` 按 label `combustion` 找到配置分区并执行 `/combustion/script`。这与 `vps2img-kexec` 完全一致（见 `vps2img-kexec.md`）。
 
+## 配置凭据与镜像校验
+
+- `--sha256` 默认必须提供并校验 raw image；只有明确接受风险时才使用 `--no-verify-image` 跳过校验。
+- `--password` 只应是临时 bootstrap 密码。Combustion 使用 `set -x`，密码可能出现在首启日志中；目标系统重启并确认 SSH 可用后必须立即修改密码，不要复用正式密码。
+- `authorized_keys` 是文本文件，只有 OpenSSH key 行中的 key body 是 base64，文件本身不是 base64。部署器会拒绝整行 `SSHKEYS`、`USERKEYS` 和生成器保留 marker；发现后请先删除或修改该整行再运行。
+
 ## 为什么仍然不安全（方案 2 的由来）
 
 `pivot_root` 只切换了挂载命名空间的根，**并不会终止旧 init 系统**：旧 kernel、旧 PID1、旧 Btrfs 都仍在运行（脚本通过 `kill -STOP 1` 和一组 `SIGSTOP` 冻结，但这只是暂停，不是撤销）。旧 root 的 **async discard** 与**脏页回写**可能在内层 `dd` 写完之后才落盘，从而破坏刚写入的镜像。这层不确定性就是 AGENTS.md 提出“方案 2：kexec + 自制 initramfs”的根本原因——kexec 真正废弃旧内核，从根上消除该风险。
