@@ -166,6 +166,19 @@ VPS2IMG_KEXEC_CONFIRM=WIPE:/dev/sda \
 
 `vps2img-pivot` 的 `pivot_root`（不使用 kexec）原理与研发测试过程见 `vps2img-pivot.md`。
 
+## 与上游 vps2arch 的关系
+
+本项目的起点是 [vps2arch](https://gitlab.com/drizzt/vps2arch)：原作者 Timothy Redaelli 用“下载 Arch bootstrap、在内存中删掉旧根、再借 bootstrap 的静态 `ld.so` 重新进入 chroot”的做法，让人第一次意识到正在运行的 Linux 还可以这样被替换。受此启发，我们让 AI 沿着这个方向继续调研（`pivot_root`、`kexec`、RAM bootstrap、旧内核回写等），并在本地 QEMU VM 上反复做快照/回滚实验，最终得到面向**整盘 raw image** 的 `vps2img-pivot` 与 `vps2img-kexec`。
+
+两者**没有源代码继承关系**：本仓库的 `main` 是独立（orphan）历史，脚本是为镜像部署重写的；`master` 分支只是保留了上游 `vps2arch` 原文件作为出发点存档。上游方法本身见 `docs/original-vps2arch.md`。
+
+## 文档索引
+
+- `docs/preprocessor.md`：`src/` 片段构建与指令语言参考。
+- `vps2img-pivot.md`：`pivot_root` 方案的原理与测试历史。
+- `vps2img-kexec.md`：`kexec` + 自制 initramfs 方案的原理与测试历史。
+- `docs/original-vps2arch.md`：上游原版 vps2arch（<https://gitlab.com/drizzt/vps2arch>）的部署方法详解——下载 Arch bootstrap 到 `/root.x86_64/`、chroot 准备、`delete_all` 清空旧根、用 bootstrap 静态 `ld.so` 重新进入 chroot 执行 `pacstrap`，以及 bootloader/网络/SSH 配置。
+
 ## 安全边界
 
 该工具会删除目标磁盘上的全部数据。不要在没有控制台、独立救援介质或可回滚快照的机器上执行。执行前必须确认：
@@ -175,4 +188,4 @@ VPS2IMG_KEXEC_CONFIRM=WIPE:/dev/sda \
 3. EFI 启动方式和 raw image 的启动文件已经在测试 VM 中验证。
 4. SSH/BMC/串口控制台可用。
 
-本项目采用 GPL-2.0-or-later。`master` 分支保留原始 vps2arch 备份；当前 `main` 是独立历史，用于 vps2img-pivot 的后续开发。
+本项目采用 GPL-2.0-or-later（全文见 `LICENSE.md`，与上游 vps2arch 的 `or (at your option) any later version` 声明一致）。`master` 分支保留原始 vps2arch（上游 <https://gitlab.com/drizzt/vps2arch>）存档，仅作参考；当前 `main` 是独立历史，代码不继承上游。
