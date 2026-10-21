@@ -64,7 +64,7 @@ http://10.68.247.14:16000/eiso/id/3/
 脚本大致按以下阶段运行：
 
 1. 识别当前 root、底层 whole disk、文件系统和网络接口。
-2. 获取 raw image 或 SquashFS image，并校验 raw image SHA256。
+2. 获取 raw image 或 SquashFS image，并校验 raw image SHA256；大镜像可由调用者显式传 `--sha256 auto` 或 `--sha256 none` 跳过。
 3. 生成只读计划；只有 `--execute` 和精确的 `VPS2IMG_PIVOT_CONFIRM=WIPE:<disk>` 同时存在时才继续。
 4. 创建独立 RAM tmpfs，复制所需二进制、动态库、镜像和配置。
 5. 脱离目标盘上的非 root 挂载点，`pivot_root` 到 RAM bootstrap。
@@ -79,7 +79,7 @@ http://10.68.247.14:16000/eiso/id/3/
 
 脚本支持：
 
-- raw image 或 SquashFS image 下载、解包和 SHA256 校验；
+- raw image 或 SquashFS image 下载、解包和 SHA256 校验（大镜像可显式使用 `--sha256 auto|none` 跳过）；
 - PVE `vmbr*` 到 bridge member、MAC 和 predictable interface name 的映射；
 - Leap Micro EFI/BIOS/Btrfs 分区保留和扩展；
 - `sgdisk --verify` 以及 root partition start/size 双重校验；

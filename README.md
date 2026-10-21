@@ -23,7 +23,7 @@ iVentoy 的 PXE 流程不直接支持这个 SelfInstall ISO，因此本项目采
 http://10.68.247.14:16000/eiso/id/3/
 ```
 
-该目录由 iVentoy 提供，镜像的具体 URL 和 SHA256 作为命令行参数传入，不在脚本中固定。默认必须提供 raw image 的 SHA256；只有显式使用 `--no-verify-image` 才会跳过校验。
+该目录由 iVentoy 提供，镜像的具体 URL 和 SHA256 作为命令行参数传入，不在脚本中固定。默认必须提供 raw image 的 SHA256；对于不适合重复计算哈希的大镜像，也可以显式使用 `--sha256 auto` 或 `--sha256 none` 跳过校验（等价于 `--no-verify-image`）。
 
 ## 设计原则
 
@@ -111,7 +111,7 @@ pivot 的旧系统在部署期间仍存活，旧 sshd 一直占着 22。若源�
 
 默认 `--image-mode auto`：源是 raw URL 时用 `stream`，否则（SquashFS 源）解压后按可用内存选择 `embed` 或 `disk`。
 
-- `stream`：initramfs 保持极小（busybox + 少量工具，几 MB），raw image 通过 HTTP 直接流式写入目标盘（`wget -O - <url> | dd of=<disk> bs=4M`），任何时候都不把整块 image 放进 RAM；随后从目标盘回读前 `--image-size` 字节做 SHA-256 校验（未给出 `--image-size` 时用 HTTP `Content-Length` 推导）。`--sha256` 默认必填；仅在明确接受风险时使用 `--no-verify-image`。
+- `stream`：initramfs 保持极小（busybox + 少量工具，几 MB），raw image 通过 HTTP 直接流式写入目标盘（`wget -O - <url> | dd of=<disk> bs=4M`），任何时候都不把整块 image 放进 RAM；随后从目标盘回读前 `--image-size` 字节做 SHA-256 校验（未给出 `--image-size` 时用 HTTP `Content-Length` 推导）。`--sha256` 默认必填；大镜像或已由其他渠道可信校验的镜像可使用 `--sha256 auto`/`--sha256 none` 或 `--no-verify-image` 明确跳过。
 - `embed`：在原系统解压 SquashFS，把整块 raw image 内嵌进 initramfs（内存 staging，非常耗内存，需确保内存放得下 raw image）。
 - `disk`：在原系统解压 SquashFS，把 raw image 放到目标盘末尾的 ext4 scratch 区（盘尾空余空间内，不写 GPT 分区，用 loop 设备访问），initramfs 再从 scratch 拷回盘首写入。scratch 区位于 raw image 之上，写盘永远不会覆盖正在读取的 scratch；最终 deploy 会依据 raw image 重建 GPT，scratch 随之消失。压缩源始终先下载到磁盘，绝不落到内存。
 

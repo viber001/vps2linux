@@ -24,7 +24,7 @@
 ### 阶段 A：源系统
 
 1. 识别当前 root、底层 whole disk、网络接口（bridge 映射到物理 member）。
-2. 下载 raw image（或从 HTTP 流式，见阶段 B）并校验 SHA256；默认必须提供 `--sha256`，只有显式 `--no-verify-image` 才跳过。
+2. 下载 raw image（或从 HTTP 流式，见阶段 B）并校验 SHA256；默认必须提供 `--sha256`。大镜像或已由其他渠道可信校验的镜像可用 `--sha256 auto`、`--sha256 none` 或 `--no-verify-image` 显式跳过。
 3. 生成只读计划；只有 `--execute` 与 `VPS2IMG_KEXEC_CONFIRM=WIPE:<disk>` 同时存在才继续。
 4. 构建自制 initramfs（cpio + gzip），用 `kexec -s -l`（`kexec_file_load`）加载源内核 + 该 initramfs，`kexec -e` 切换。
 
@@ -33,7 +33,7 @@
 自制 initramfs 里没有 systemd，PID1 是 `/init` 脚本，依次：
 
 1. `load_required_modules`：写入 mdev 的 modalias 自动加载规则、`mdev -s`，再 `modprobe` 必要模块。
-2. 通过 HTTP **流式**下载 raw image 并直接写入目标盘（`wget -O - | dd bs=4M`），全程不把镜像放进内存；写入后回读头部校验 SHA256。默认校验不可省略，除非显式使用 `--no-verify-image`。
+2. 通过 HTTP **流式**下载 raw image 并直接写入目标盘（`wget -O - | dd bs=4M`），全程不把镜像放进内存；写入后回读头部校验 SHA256。默认校验不可省略；大镜像可用 `--sha256 auto`、`--sha256 none` 或 `--no-verify-image` 显式跳过。
 3. `sgdisk` 重建 GPT（保留 raw image 的 BIOS/EFI 分区 GUID）。
 4. 用 loop 设备 `mkfs.ext4 -L combustion` 建配置分区，写入 `/combustion/script`。
 5. 把 root 分区 `btrfs filesystem resize max` 扩到 `--root-size-gib`。

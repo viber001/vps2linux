@@ -20,7 +20,9 @@ Options:
   --image-url URL       Raw image URL (default: streamed to the target disk).
                         A .squashfs URL needs disk or embed mode.
   --image-file FILE     Local raw image or SquashFS file (used with embed mode)
-  --sha256 HASH         Expected SHA-256 of the raw image (required by default)
+  --sha256 HASH|auto|none
+                         Expected SHA-256 (required by default); auto/none skip
+                         raw-image verification for large or locally trusted images
   --no-verify-image     Explicitly disable raw-image SHA-256 verification
   --image-size BYTES    Expected raw image size; auto-detected from the HTTP
                         Content-Length when omitted (stream mode)

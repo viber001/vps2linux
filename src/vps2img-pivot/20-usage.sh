@@ -10,7 +10,9 @@ VPS2IMG_PIVOT_CONFIRM value before any disk is written.
 Options:
   --image-url URL       Raw image or SquashFS URL
   --image-file FILE     Local raw image or SquashFS file
-  --sha256 HASH         Expected SHA-256 of the raw image (required by default)
+  --sha256 HASH|auto|none
+                         Expected SHA-256 (required by default); auto/none skip
+                         raw-image verification for large or locally trusted images
   --no-verify-image     Explicitly disable raw-image SHA-256 verification
   --disk DEVICE         Target whole disk (default: disk containing /)
   --hostname NAME       Hostname written by Combustion

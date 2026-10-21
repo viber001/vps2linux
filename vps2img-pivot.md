@@ -63,7 +63,7 @@ RAM bootstrap 内层部署
 
 ## 配置凭据与镜像校验
 
-- `--sha256` 默认必须提供并校验 raw image；只有明确接受风险时才使用 `--no-verify-image` 跳过校验。
+- `--sha256` 默认必须提供并校验 raw image；大镜像或已由其他渠道可信校验的镜像可使用 `--sha256 auto`、`--sha256 none` 或 `--no-verify-image` 明确跳过校验。
 - `--password` 只应是临时 bootstrap 密码。Combustion 使用 `set -x`，密码可能出现在首启日志中；目标系统重启并确认 SSH 可用后必须立即修改密码，不要复用正式密码。
 - `authorized_keys` 是文本文件，只有 OpenSSH key 行中的 key body 是 base64，文件本身不是 base64。部署器会拒绝整行 `SSHKEYS`、`USERKEYS` 和生成器保留 marker；发现后请先删除或修改该整行再运行。
 
