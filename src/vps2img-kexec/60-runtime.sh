@@ -213,6 +213,7 @@ resolve_ramdisk_source() {
 			missing=$(missing_host_tools)
 			if [[ -z "$missing" ]]; then
 				printf '%s\n' 'Ramdisk source: the host already provides every tool; staging the host.'
+				RAMDISK_SOURCE=host
 			else
 				printf 'Ramdisk source: the host lacks %s; fetching the Debian installer components over HTTP.\n' \
 					"$(printf '%s ' $missing | sed 's/ $//')"
