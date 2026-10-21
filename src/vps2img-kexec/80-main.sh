@@ -79,7 +79,7 @@ di_parse_index() {
 	done < <(awk -v dist="$dist" '
 		/^Package: /{ name=substr($0,10) }
 		/^Filename: /{ filename=substr($0,11) }
-		/^SHA256: /{ sha256=substr($0,10) }
+		/^SHA256: /{ sha256=substr($0,9) }
 		/^Depends: /{ dependencies=dependencies (dependencies?" ":"") substr($0,10) }
 		/^Pre-Depends: /{ dependencies=dependencies (dependencies?" ":"") substr($0,13) }
 		/^$/{ if(name!=""){ print name "\t" filename "\t" dependencies "\t" sha256 } name="";filename="";dependencies="";sha256="" }
