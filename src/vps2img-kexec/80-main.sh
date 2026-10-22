@@ -371,6 +371,7 @@ finalize_initramfs() {
 		printf 'IMAGE_SHA256=%q\n' "$IMAGE_SHA256"
 		printf 'IMAGE_SIZE=%q\n' "$IMAGE_SIZE"
 		printf 'VERIFY_IMAGE=%q\n' "$VERIFY_IMAGE"
+		printf 'IMAGE_VERIFY_REASON=%q\n' "$IMAGE_VERIFY_REASON"
 		printf 'SCRATCH_OFFSET=%q\n' "$SCRATCH_OFFSET"
 		printf 'SCRATCH_BYTES=%q\n' "$SCRATCH_BYTES"
 		printf 'DROPBEAR_BIN=%q\n' "$DROPBEAR_BIN"

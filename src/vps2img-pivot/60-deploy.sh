@@ -21,11 +21,7 @@ print_plan() {
 	printf '%s\n' '=== VPS2IMG_PIVOT PLAN ==='
 	(#@INCLUDE@expand) src/assets/plan-base.sh
 	printf 'raw image:       %s (%s bytes)\n' "$RAW_FILE" "$size_bytes"
-	if [[ "$VERIFY_IMAGE" == 1 ]]; then
-		printf 'image sha256:    %s (verification enabled)\n' "$IMAGE_SHA256"
-	else
-		printf '%s\n' 'image sha256:    verification disabled (--no-verify-image)'
-	fi
+	(#@INCLUDE@expand) src/assets/plan-image-sha.sh
 	(#@INCLUDE@expand) src/assets/plan-target.sh
 	printf 'login user:      %s\n' "$TARGET_USER"
 	(#@INCLUDE@expand) src/assets/plan-disk.sh
@@ -40,7 +36,7 @@ print_plan() {
 
 check_dependencies() {
 	local command_name
-	for command_name in awk blockdev cp dd findmnt lsblk mount readlink rm sha256sum sfdisk sgdisk stat sync tr umount; do
+	for command_name in awk blockdev cp dd findmnt grep lsblk mount readlink rm sha256sum sfdisk sgdisk stat sync tr umount; do
 		need_command "$command_name"
 	done
 	for command_name in hostname ip mountpoint paste; do

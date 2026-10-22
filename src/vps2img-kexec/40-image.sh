@@ -53,25 +53,7 @@ last_used_end() {
 GPT_RESERVED_SECTORS=34
 SCRATCH_ALIGN_SECTORS=2048
 
-check_image_verification() {
-	case "$VERIFY_IMAGE" in
-		0) warn 'raw-image SHA-256 verification disabled by --no-verify-image' ;;
-		1)
-			case "$IMAGE_SHA256" in
-				auto|none)
-					warn "raw-image SHA-256 verification disabled by --sha256 $IMAGE_SHA256"
-					IMAGE_SHA256=
-					VERIFY_IMAGE=0
-					return 0
-					;;
-			esac
-			[[ "$IMAGE_SHA256" =~ ^[0-9A-Fa-f]{64}$ ]] || \
-				die 'raw-image SHA-256 verification is enabled; pass a 64-hex --sha256 value, use --sha256 auto/none, or use --no-verify-image explicitly'
-			IMAGE_SHA256=$(printf '%s' "$IMAGE_SHA256" | tr '[:upper:]' '[:lower:]')
-			;;
-		*) die "invalid image verification setting: $VERIFY_IMAGE (use 0 or 1)" ;;
-	esac
-}
+(#@INCLUDE@expand) src/assets/verify-image.sh
 
 resolve_image_mode() {
 	case "$IMAGE_MODE_REQUEST" in

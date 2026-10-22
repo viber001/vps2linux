@@ -103,13 +103,9 @@ print_plan() {
 		printf 'image source:    %s (unpacked on the source, staged on a %s MiB scratch area at the end of the target disk)\n' \
 			"${IMAGE_URL:-$IMAGE_FILE}" "$(( ${SCRATCH_BYTES:-0} / 1048576 ))"
 	else
-	printf 'image source:    %s (embedded in initramfs, %s bytes)\n' "$RAW_FILE" "$size_bytes"
+		printf 'image source:    %s (embedded in initramfs, %s bytes)\n' "$RAW_FILE" "$size_bytes"
 	fi
-	if [[ "$VERIFY_IMAGE" == 1 ]]; then
-		printf 'image sha256:    %s (verification enabled)\n' "$IMAGE_SHA256"
-	else
-		printf '%s\n' 'image sha256:    verification disabled (--no-verify-image)'
-	fi
+	(#@INCLUDE@expand) src/assets/plan-image-sha.sh
 	(#@INCLUDE@expand) src/assets/plan-target.sh
 	(#@INCLUDE@expand) src/assets/plan-disk.sh
 	if [[ "$IMAGE_MODE" == embed ]]; then
@@ -400,7 +396,7 @@ bring_up_network() {
 
 verify_image() {
 	if [ "${VERIFY_IMAGE:-1}" != 1 ]; then
-		log 'WARNING: image SHA-256 verification was explicitly disabled'
+		log "WARNING: image SHA-256 verification disabled (${IMAGE_VERIFY_REASON:---no-verify-image})"
 		return 0
 	fi
 	if [ -z "${IMAGE_SIZE:-}" ] || [ -z "${IMAGE_SHA256:-}" ]; then
