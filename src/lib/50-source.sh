@@ -1,3 +1,12 @@
+# lsblk grew the PATH column in util-linux 2.27; older releases (for example
+# CentOS 7's 2.23) reject it and abort under pipefail. KNAME exists on both,
+# and is printed without the /dev/ prefix on old and new versions alike.
+lsblk_whole_disk() {
+	local node=$1
+	lsblk -sno KNAME,TYPE "$node" 2>/dev/null |
+		awk '$2 == "disk" { print ($1 ~ /^\// ? $1 : "/dev/" $1); exit }'
+}
+
 discover_source() {
 	ROOT_SOURCE=$(findmnt -nro SOURCE /) || die 'cannot determine the current root source'
 	# On a btrfs subvolume root findmnt prints the device with the subvolume,
@@ -7,7 +16,7 @@ discover_source() {
 	# other non-device source name makes lsblk fail and would abort under
 	# pipefail before the fallbacks below get a chance to run.
 	if [[ -b "$ROOT_SOURCE" ]]; then
-		SOURCE_DISK=$(lsblk -sno PATH,TYPE "$ROOT_SOURCE" 2>/dev/null | awk '$2 == "disk" { print $1; exit }')
+		SOURCE_DISK=$(lsblk_whole_disk "$ROOT_SOURCE")
 	fi
 	# An immutable OS image (for example Harvester/cOS) boots with the root on a
 	# loop device whose backing file lives on another partition; lsblk -s on the
@@ -36,7 +45,7 @@ loop_backing_disk() {
 	[[ -n "$backing" ]] || return 0
 	while read -r target source; do
 		[[ -e "$target$backing" ]] || continue
-		disk=$(lsblk -sno PATH,TYPE "$source" | awk '$2 == "disk" { print $1; exit }')
+		disk=$(lsblk_whole_disk "$source")
 		[[ -n "$disk" ]] && { printf '%s\n' "$disk"; return 0; }
 	done < <(findmnt -rno TARGET,SOURCE)
 	# Return success even when nothing matched: the caller reports the missing
@@ -56,7 +65,7 @@ dataset_backing_disk() {
 	[[ -n "$pool" ]] || return 0
 	dev=$(zpool status -P "$pool" 2>/dev/null | awk '$1 ~ /^\/dev\// { print $1; exit }')
 	[[ -n "$dev" ]] || return 0
-	disk=$(lsblk -sno PATH,TYPE "$dev" 2>/dev/null | awk '$2 == "disk" { print $1; exit }')
+	disk=$(lsblk_whole_disk "$dev")
 	printf '%s\n' "${disk:-$dev}"
 	return 0
 }

@@ -107,9 +107,9 @@ ISO 内的证据（`http://10.68.247.14:16000/eiso/id/3/`）：
 
 `vps2img-kexec` 在 Secure Boot 开启时通过 `kexec_file_load` 工作，**无需关闭 Secure Boot**：
 
-- 启用 Secure Boot 时内核进入 lockdown，只允许 `kexec_file_load`（`kexec -s`），禁止旧 syscall `kexec_load`（`kexec -c`，会报 `kexec_load failed: Operation not permitted on UEFI SecureBoot`）。
+- 启用 Secure Boot 时内核进入 lockdown，只允许 `kexec_file_load`（`kexec -s`），禁止旧 syscall `kexec_load`（新 kexec-tools 用 `kexec -c` 选择它，会报 `kexec_load failed: Operation not permitted on UEFI SecureBoot`；旧版如 CentOS 7 的 2.0.15 没有 `-c`，`-l` 本身就是 legacy syscall）。
 - `kexec_file_load` 要求被加载的内核镜像已被固件信任或签名。脚本默认加载**当前正在运行的内核**（`/boot/vmlinuz-$(uname -r)`，可用 `--kernel` 覆盖），它已经在 Secure Boot 下启动，因此是受信任的；自制 initramfs 作为数据附加，不参与内核签名校验。
-- 因此 `run_kexec` 与 `--stage-test` 默认先尝试 `kexec -s -l`；只有 `-s` 失败且系统未处于 lockdown 时才回退到 `kexec -c -l`（打印明确提示）。lockdown 检测不再致命，只告警并走 `-s` 路径。
+- 因此 `run_kexec` 与 `--stage-test` 默认先尝试 `kexec -s -l`；只有 `-s` 失败且系统未处于 lockdown 时才回退到 `kexec_load`：kexec-tools 支持 `--kexec-syscall` 时显式加 `-c`（`kexec -c -l`），不支持时直接用 `-l`。两种情况都会打印明确提示。
 
 > 注意：`kexec_file_load` 加载的内核必须是当前运行的内核（或镜像自带的已签名内核）。换用未签名的自定义内核在 Secure Boot 下仍会被拒绝。
 
@@ -122,6 +122,7 @@ ISO 内的证据（`http://10.68.247.14:16000/eiso/id/3/`）：
 - 在 openSUSE Leap Micro 6.2 源（无可用的 `apt`、无 `ar`/binutils）上验证：`debian`（该源上 `auto` 也解析为它）经 HTTPS 组装 ramdisk 后 `--execute` 部署成功，目标 `pve2-leap-test` 启动、静态网络/用户/密码/wheel sudo/SSH key 生效，Btrfs 无损坏；`--ramdisk-source apt` 在该源上按预期拒绝（无 `apt-get`）。`apt` 模式在 PVE Debian 源上（缺 `kexec-tools`）经 `apt-get` 补齐后按 host 模式构建成功。
 - Harvester 节点（Harvester v1.8.2 / SLES 16，root 是 loop 设备 `/dev/loop0`，backing file `/cOS/active.img` 落在 `COS_STATE` 分区）：`discover_source` 新增 loop-root 回退后，p123 / p126 的 `--dry-run` 均输出完整计划（`source root: /dev/loop0 (ext2)`、`source disk: /dev/sda`），并已 `--execute` 实测成功——两节点各自整盘覆盖为 Leap Micro 6.2（kernel 6.12.0-160000.35-default），保留原 IP，`leap` 用户 / wheel sudo / SSH key 生效，EFI `vps2img-kexec` 启动项建立，btrfs 无 error；镜像经 RAM 内网络从同网段的一台 Leap Micro 临时 HTTP 服务 stream。PVE ext4+LVM、PVE/Leap Micro Btrfs 等非 loop 根不受影响。
 - `--image-mode disk`（SquashFS 源，VM 602，400G 盘）：原始 OS 侧解压 SquashFS 到目标盘末尾新建的 ext4 scratch 区（loop 设备，不动 GPT），initramfs 从 scratch 拷回盘首写入。`--image-mode auto` 在 4G 内存的 VM 602 上因 raw image（3.55G）放不进内存而正确选择 `disk`；`--execute` 成功，重启进入 `pve2-leap-test`（root 64G btrfs、combustion 分区、静态网络、`leap` wheel sudo/SSH 全部生效，Btrfs 无 error）。`--image-mode embed` 在同一源上仍输出正确计划（3.55G raw 内嵌 initramfs）。scratch 区位于 raw image 之后，最终 deploy 依据 raw image 重建 GPT，scratch 消失。
+- CentOS 7 源（Source OS 内核 `3.10.0-862.el7.x86_64`、util-linux `2.23.2`、kexec-tools `2.0.15`）在 rke124 上完成 `--execute`：`lsblk` 改用兼容的 `KNAME` 列，kexec 在不支持 `--kexec-syscall` 时省略 `-c`，mkfs 按源内核剥离 `metadata_csum_seed`/`orphan_file`。deploy 曾因最后一项报 `status 32`（`unsupported optional features (2000)`），经 BMC SOL 在救援 initramfs 内修正同一参数后写盘成功，重启进入 Leap Micro 6.2。三处修复均已回填源码。
 - 救援 SSH：initramfs 的 dropbear 在**重启前的写盘阶段即监听 22**，仅 root 公钥登录（`--ssh-key-file`），host key 为构建期临时生成。VM 600（ext4+LVM 源）与 VM 602（Btrfs 源）的 `--execute` 过程中该端口均可用，写盘失败时 `rescue()` 保持 22 与串口 shell 不退出。
 
 ## 已知限制

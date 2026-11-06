@@ -407,10 +407,20 @@ finalize_initramfs() {
 # kexec slot. Under UEFI Secure Boot the kernel is locked down and only
 # kexec_file_load (-s) is permitted, and only for a kernel image the firmware
 # already trusts -- the running, signed kernel that booted under Secure Boot.
-# kexec_load (-c) is kept as a fallback for a host without lockdown, where the
-# legacy syscall is still allowed.
+# kexec_load is kept as a fallback for a host without lockdown, where the
+# legacy syscall is still allowed. kexec-tools before 2.0.23 has no
+# -c/--kexec-syscall flag (CentOS 7 ships 2.0.15); there -l already selects the
+# legacy kexec_load syscall, so the flag can be omitted.
+kexec_has_legacy_flag() {
+	"$KEXEC_BIN" --help 2>&1 | grep -q -- '--kexec-syscall'
+}
+
 load_kexec_image() {
 	local command_line=$1
+	local -a load_args=(-l)
+	if kexec_has_legacy_flag; then
+		load_args=(-c -l)
+	fi
 	printf 'Loading kernel with kexec_file_load (-s): %s\n' "$KEXEC_KERNEL"
 	if "$KEXEC_BIN" -s -l "$KEXEC_KERNEL" --initrd="$INITRAMFS" --command-line="$command_line"; then
 		KEXEC_METHOD=file
@@ -419,17 +429,21 @@ load_kexec_image() {
 	if (( KEXEC_LOCKDOWN )); then
 		die 'kexec_file_load (-s) was rejected while lockdown is active; the running kernel was not accepted as a trusted image'
 	fi
-	printf '%s\n' 'kexec_file_load (-s) failed; falling back to kexec_load (-c)'
-	"$KEXEC_BIN" -c -l "$KEXEC_KERNEL" --initrd="$INITRAMFS" --command-line="$command_line" || \
-		die 'kexec could not load the kernel with either kexec_file_load (-s) or kexec_load (-c)'
+	printf '%s\n' 'kexec_file_load (-s) failed; falling back to kexec_load'
+	"$KEXEC_BIN" "${load_args[@]}" "$KEXEC_KERNEL" --initrd="$INITRAMFS" --command-line="$command_line" || \
+		die 'kexec could not load the kernel with either kexec_file_load (-s) or kexec_load'
 	KEXEC_METHOD=legacy
 }
 
 # unload_kexec_image clears whatever load_kexec_image put in the kexec slot,
 # preferring the syscall that actually loaded it.
 unload_kexec_image() {
+	local -a unload_args=(-u)
 	if [[ "$KEXEC_METHOD" == legacy ]]; then
-		"$KEXEC_BIN" -c -u 2>/dev/null || "$KEXEC_BIN" -u
+		if kexec_has_legacy_flag; then
+			unload_args=(-c -u)
+		fi
+		"$KEXEC_BIN" "${unload_args[@]}" 2>/dev/null || "$KEXEC_BIN" -u
 	else
 		"$KEXEC_BIN" -s -u 2>/dev/null || "$KEXEC_BIN" -u
 	fi

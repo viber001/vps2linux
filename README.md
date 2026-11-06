@@ -104,7 +104,7 @@ pivot 的旧系统在部署期间仍存活，旧 sshd 一直占着 22。若源�
 要求：
 
 - 内核需支持 kexec（`kexec_load` 自 Linux 2.6.13，`kexec_file_load` 自 3.17）：物理机、KVM/Xen/HN 可用，容器（OpenVZ/LXC）不可用。
-- 默认用 `kexec_file_load`（`kexec -s -l`）加载**当前正在运行的内核**，因此 **Secure Boot 可以保持开启**（lockdown 只禁止旧的 `kexec_load`）。仅当 `-s` 失败且系统未处于 lockdown 时才回退到 `kexec -c -l`；`--kernel` 指定未签名内核时仍需关闭 Secure Boot。
+- 默认用 `kexec_file_load`（`kexec -s -l`）加载**当前正在运行的内核**，因此 **Secure Boot 可以保持开启**（lockdown 只禁止旧的 `kexec_load`）。仅当 `-s` 失败且系统未处于 lockdown 时才回退到 `kexec_load`：kexec-tools 支持 `--kexec-syscall` 时用 `kexec -c -l`，不支持时（如 CentOS 7 的 2.0.15）直接用 `kexec -l`；`--kernel` 指定未签名内核时仍需关闭 Secure Boot。
 - ramdisk 用户态默认 `--ramdisk-source auto`：宿主工具齐全时 staging 宿主，否则经 HTTPS 下载 d-i 组件组装。宿主至少需要 `cpio`、`gzip`、`gdisk`/`sgdisk`（`--image-mode stream` 直接流式写 raw image，不需要 `squashfs-tools`；`embed`/`disk` 对 SquashFS 源需要在宿主上有 `unsquashfs`）。详见下文。
 - initramfs 按整条设备链收集在用驱动模块（`lsmod` + 目标磁盘/网卡驱动闭包）和固件，以便在物理机上启动；内核内置的驱动自动跳过。
 - initramfs 内置 **dropbear 救援 shell，监听 22 端口**：拉起网络后即启动（成功写盘前与失败路径都保留），仅允许 root 公钥登录（`--ssh-key-file`），host key 为构建时临时生成，故每次部署的指纹都不同。
